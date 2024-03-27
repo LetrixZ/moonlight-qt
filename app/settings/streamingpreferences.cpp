@@ -1,8 +1,10 @@
 #include "streamingpreferences.h"
+#include "utils.h"
 
 #include <QTranslator>
 #include <QCoreApplication>
 #include <QLocale>
+#include <QtMath>
 
 #include <QtDebug>
 
@@ -18,9 +20,9 @@
 #define SER_MULTICONT "multicontroller"
 #define SER_AUDIOCFG "audiocfg"
 #define SER_VIDEOCFG "videocfg"
+#define SER_HDR "hdr"
 #define SER_VIDEODEC "videodec"
 #define SER_WINDOWMODE "windowmode"
-#define SER_UNSUPPORTEDFPS "unsupportedfps"
 #define SER_MDNS "mdns"
 #define SER_QUITAPPAFTER "quitAppAfter"
 #define SER_ABSMOUSEMODE "mouseacceleration"
@@ -40,11 +42,12 @@
 #define SER_REVERSESCROLL "reversescroll"
 #define SER_SWAPFACEBUTTONS "swapfacebuttons"
 #define SER_CAPTURESYSKEYS "capturesyskeys"
+#define SER_KEEPAWAKE "keepawake"
 #define SER_LANGUAGE "language"
 #define SER_PROFILES "profiles"
 #define SER_ACTIVEPROFILE "activeprofile"
 
-#define CURRENT_DEFAULT_VER 1
+#define CURRENT_DEFAULT_VER 2
 
 StreamingPreferences::StreamingPreferences(QObject *parent)
     : QObject(parent),
@@ -69,13 +72,22 @@ void StreamingPreferences::reload()
 #ifdef Q_OS_DARWIN
     recommendedFullScreenMode = WindowMode::WM_FULLSCREEN_DESKTOP;
 #else
-    recommendedFullScreenMode = WindowMode::WM_FULLSCREEN;
+    // Wayland doesn't support modesetting, so use fullscreen desktop mode.
+    if (WMUtils::isRunningWayland())
+    {
+        recommendedFullScreenMode = WindowMode::WM_FULLSCREEN_DESKTOP;
+    }
+    else
+    {
+        recommendedFullScreenMode = WindowMode::WM_FULLSCREEN;
+    }
 #endif
 
-    //check to see if the user has created any profiles
+    // check to see if the user has created any profiles
     profiles.clear();
     int size = settings.beginReadArray(SER_PROFILES);
-    for (int i = 0; i < size; ++i) {
+    for (int i = 0; i < size; ++i)
+    {
         settings.setArrayIndex(i);
 
         Profile profile;
@@ -98,7 +110,6 @@ void StreamingPreferences::reload()
     gameOptimizations = settings.value(SER_GAMEOPTS, true).toBool();
     playAudioOnHost = settings.value(SER_HOSTAUDIO, false).toBool();
     multiController = settings.value(SER_MULTICONT, true).toBool();
-    unsupportedFps = settings.value(SER_UNSUPPORTEDFPS, false).toBool();
     enableMdns = settings.value(SER_MDNS, true).toBool();
     quitAppAfter = settings.value(SER_QUITAPPAFTER, false).toBool();
     absoluteMouseMode = settings.value(SER_ABSMOUSEMODE, false).toBool();
@@ -114,23 +125,31 @@ void StreamingPreferences::reload()
     backgroundGamepad = settings.value(SER_BACKGROUNDGAMEPAD, false).toBool();
     reverseScrollDirection = settings.value(SER_REVERSESCROLL, false).toBool();
     swapFaceButtons = settings.value(SER_SWAPFACEBUTTONS, false).toBool();
+    keepAwake = settings.value(SER_KEEPAWAKE, true).toBool();
+    enableHdr = settings.value(SER_HDR, false).toBool();
     captureSysKeysMode = static_cast<CaptureSysKeysMode>(settings.value(SER_CAPTURESYSKEYS,
-                                                         static_cast<int>(CaptureSysKeysMode::CSK_OFF)).toInt());
+                                                                        static_cast<int>(CaptureSysKeysMode::CSK_OFF))
+                                                             .toInt());
     audioConfig = static_cast<AudioConfig>(settings.value(SER_AUDIOCFG,
-                                                  static_cast<int>(AudioConfig::AC_STEREO)).toInt());
+                                                          static_cast<int>(AudioConfig::AC_STEREO))
+                                               .toInt());
     videoCodecConfig = static_cast<VideoCodecConfig>(settings.value(SER_VIDEOCFG,
-                                                  static_cast<int>(VideoCodecConfig::VCC_AUTO)).toInt());
+                                                                    static_cast<int>(VideoCodecConfig::VCC_AUTO))
+                                                         .toInt());
     videoDecoderSelection = static_cast<VideoDecoderSelection>(settings.value(SER_VIDEODEC,
-                                                  static_cast<int>(VideoDecoderSelection::VDS_AUTO)).toInt());
+                                                                              static_cast<int>(VideoDecoderSelection::VDS_AUTO))
+                                                                   .toInt());
     windowMode = static_cast<WindowMode>(settings.value(SER_WINDOWMODE,
                                                         // Try to load from the old preference value too
-                                                        static_cast<int>(settings.value(SER_FULLSCREEN, true).toBool() ?
-                                                                             recommendedFullScreenMode : WindowMode::WM_WINDOWED)).toInt());
+                                                        static_cast<int>(settings.value(SER_FULLSCREEN, true).toBool() ? recommendedFullScreenMode : WindowMode::WM_WINDOWED))
+                                             .toInt());
     uiDisplayMode = static_cast<UIDisplayMode>(settings.value(SER_UIDISPLAYMODE,
-                                               static_cast<int>(settings.value(SER_STARTWINDOWED, true).toBool() ? UIDisplayMode::UI_WINDOWED
-                                                                                                                 : UIDisplayMode::UI_MAXIMIZED)).toInt());
+                                                              static_cast<int>(settings.value(SER_STARTWINDOWED, true).toBool() ? UIDisplayMode::UI_WINDOWED
+                                                                                                                                : UIDisplayMode::UI_MAXIMIZED))
+                                                   .toInt());
     language = static_cast<Language>(settings.value(SER_LANGUAGE,
-                                                    static_cast<int>(Language::LANG_AUTO)).toInt());
+                                                    static_cast<int>(Language::LANG_AUTO))
+                                         .toInt());
 
     if (!activeProfileName.isEmpty())
     {
@@ -138,51 +157,72 @@ void StreamingPreferences::reload()
     }
 
     // Perform default settings updates as required based on last default version
-    if (defaultVer == 0) {
+    if (defaultVer < 1)
+    {
 #ifdef Q_OS_DARWIN
         // Update window mode setting on macOS from full-screen (old default) to borderless windowed (new default)
-        if (windowMode == WindowMode::WM_FULLSCREEN) {
+        if (windowMode == WindowMode::WM_FULLSCREEN)
+        {
             windowMode = WindowMode::WM_FULLSCREEN_DESKTOP;
         }
 #endif
+    }
+    if (defaultVer < 2)
+    {
+        if (windowMode == WindowMode::WM_FULLSCREEN && WMUtils::isRunningWayland())
+        {
+            windowMode = WindowMode::WM_FULLSCREEN_DESKTOP;
+        }
+    }
+
+    // Fixup VCC value to the new settings format with codec and HDR separate
+    if (videoCodecConfig == VCC_FORCE_HEVC_HDR_DEPRECATED)
+    {
+        videoCodecConfig = VCC_AUTO;
+        enableHdr = true;
     }
 }
 
 bool StreamingPreferences::retranslate()
 {
-    static QTranslator* translator = nullptr;
+    static QTranslator *translator = nullptr;
 
 #if QT_VERSION < QT_VERSION_CHECK(5, 10, 0)
-    if (m_QmlEngine != nullptr) {
+    if (m_QmlEngine != nullptr)
+    {
         // Dynamic retranslation is not supported until Qt 5.10
         return false;
     }
 #endif
 
-    QTranslator* newTranslator = new QTranslator();
+    QTranslator *newTranslator = new QTranslator();
     QString languageSuffix = getSuffixFromLanguage(language);
 
     // Remove the old translator, even if we can't load a new one.
     // Otherwise we'll be stuck with the old translated values instead
     // of defaulting to English.
-    if (translator != nullptr) {
+    if (translator != nullptr)
+    {
         QCoreApplication::removeTranslator(translator);
         delete translator;
         translator = nullptr;
     }
 
-    if (newTranslator->load(QString(":/languages/qml_") + languageSuffix)) {
-        qInfo() << "Successfully loaded translation for " << languageSuffix;
+    if (newTranslator->load(QString(":/languages/qml_") + languageSuffix))
+    {
+        qInfo() << "Successfully loaded translation for" << languageSuffix;
 
         translator = newTranslator;
         QCoreApplication::installTranslator(translator);
     }
-    else {
-        qInfo() << "No translation available for " << languageSuffix;
+    else
+    {
+        qInfo() << "No translation available for" << languageSuffix;
         delete newTranslator;
     }
 
-    if (m_QmlEngine != nullptr) {
+    if (m_QmlEngine != nullptr)
+    {
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
         // This is a dynamic retranslation from the settings page.
         // We have to kick the QML engine into reloading our text.
@@ -192,7 +232,8 @@ bool StreamingPreferences::retranslate()
         Q_ASSERT(false);
 #endif
     }
-    else {
+    else
+    {
         // This is a translation from a non-QML context, which means
         // it is probably app startup. There's nothing to refresh.
     }
@@ -211,7 +252,7 @@ QString StreamingPreferences::getSuffixFromLanguage(StreamingPreferences::Langua
     case LANG_FR:
         return "fr";
     case LANG_ZH_CN:
-        return "zh_cn";
+        return "zh_CN";
     case LANG_NB_NO:
         return "nb_NO";
     case LANG_RU:
@@ -222,6 +263,38 @@ QString StreamingPreferences::getSuffixFromLanguage(StreamingPreferences::Langua
         return "ja";
     case LANG_VI:
         return "vi";
+    case LANG_TH:
+        return "th";
+    case LANG_KO:
+        return "ko";
+    case LANG_HU:
+        return "hu";
+    case LANG_NL:
+        return "nl";
+    case LANG_SV:
+        return "sv";
+    case LANG_TR:
+        return "tr";
+    case LANG_UK:
+        return "uk";
+    case LANG_ZH_TW:
+        return "zh_TW";
+    case LANG_PT:
+        return "pt";
+    case LANG_PT_BR:
+        return "pt_BR";
+    case LANG_EL:
+        return "el";
+    case LANG_IT:
+        return "it";
+    case LANG_HI:
+        return "hi";
+    case LANG_PL:
+        return "pl";
+    case LANG_CS:
+        return "cs";
+    case LANG_HE:
+        return "he";
     case LANG_AUTO:
     default:
         return QLocale::system().name();
@@ -245,7 +318,6 @@ void StreamingPreferences::save()
     settings.setValue(SER_GAMEOPTS, gameOptimizations);
     settings.setValue(SER_HOSTAUDIO, playAudioOnHost);
     settings.setValue(SER_MULTICONT, multiController);
-    settings.setValue(SER_UNSUPPORTEDFPS, unsupportedFps);
     settings.setValue(SER_MDNS, enableMdns);
     settings.setValue(SER_QUITAPPAFTER, quitAppAfter);
     settings.setValue(SER_ABSMOUSEMODE, absoluteMouseMode);
@@ -257,6 +329,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_PACKETSIZE, packetSize);
     settings.setValue(SER_DETECTNETBLOCKING, detectNetworkBlocking);
     settings.setValue(SER_AUDIOCFG, static_cast<int>(audioConfig));
+    settings.setValue(SER_HDR, enableHdr);
     settings.setValue(SER_VIDEOCFG, static_cast<int>(videoCodecConfig));
     settings.setValue(SER_VIDEODEC, static_cast<int>(videoDecoderSelection));
     settings.setValue(SER_WINDOWMODE, static_cast<int>(windowMode));
@@ -269,6 +342,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_REVERSESCROLL, reverseScrollDirection);
     settings.setValue(SER_SWAPFACEBUTTONS, swapFaceButtons);
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
+    settings.setValue(SER_KEEPAWAKE, keepAwake);
 
     if (!activeProfileName.isEmpty())
     {
@@ -278,10 +352,11 @@ void StreamingPreferences::save()
     saveProfiles(settings);
 }
 
-void StreamingPreferences::saveProfiles(QSettings& settings)
+void StreamingPreferences::saveProfiles(QSettings &settings)
 {
     settings.beginWriteArray(SER_PROFILES);
-    for (int i = 0; i < profiles.size(); ++i) {
+    for (int i = 0; i < profiles.size(); ++i)
+    {
         settings.setArrayIndex(i);
         settings.setValue("name", profiles[i].name);
     }
@@ -293,9 +368,9 @@ void StreamingPreferences::saveProfiles(QSettings& settings)
 bool StreamingPreferences::createNewProfile(QString profileName)
 {
     int prevProfilesSize = profiles.size();
-    
+
     bool profileNameAlreadyExists = false;
-    for (int i = 0; i < profiles.size(); i++) 
+    for (int i = 0; i < profiles.size(); i++)
     {
         if (profiles[i].name.compare(profileName) == 0)
         {
@@ -310,7 +385,7 @@ bool StreamingPreferences::createNewProfile(QString profileName)
         newProfile.name = profileName;
         profiles.append(newProfile);
 
-        //the new profile is immediately made active for the user
+        // the new profile is immediately made active for the user
         activeProfileName = profileName;
 
         save();
@@ -333,7 +408,7 @@ bool StreamingPreferences::createNewProfile(QString profileName)
 void StreamingPreferences::deleteProfile(QString profileName)
 {
     bool deleted = false;
-    for (int i = 0; i < profiles.size(); i++) 
+    for (int i = 0; i < profiles.size(); i++)
     {
         if (profiles[i].name.compare(profileName) == 0)
         {
@@ -349,10 +424,10 @@ void StreamingPreferences::deleteProfile(QString profileName)
             }
 
             QSettings settings;
-            //remove all keys for the deleted profile in the save data
+            // remove all keys for the deleted profile in the save data
             settings.remove(profileName);
 
-            //remove the deleted profile entry in the profiles list by rewriting all profiles to the save data
+            // remove the deleted profile entry in the profiles list by rewriting all profiles to the save data
             saveProfiles(settings);
 
             deleted = true;
@@ -361,11 +436,11 @@ void StreamingPreferences::deleteProfile(QString profileName)
         }
     }
 
-    if (deleted) 
+    if (deleted)
     {
         reload();
 
-        if (profiles.size() == 0) 
+        if (profiles.size() == 0)
         {
             emit hasProfilesChanged();
         }
@@ -380,7 +455,7 @@ QVariant StreamingPreferences::getProfiles()
 
     for (int i = 0; i < profiles.size(); i++)
     {
-        Profile* profile = &profiles[i];
+        Profile *profile = &profiles[i];
 
         QVariantMap itemMap;
         itemMap.insert("name", profile->name);
@@ -409,7 +484,7 @@ void StreamingPreferences::changeActiveProfile(QString newProfileName)
     saveProfiles(settings);
     reload();
 
-    if (language != previousLanguage) 
+    if (language != previousLanguage)
     {
         retranslate();
     }
@@ -419,28 +494,58 @@ void StreamingPreferences::changeActiveProfile(QString newProfileName)
 
 int StreamingPreferences::getDefaultBitrate(int width, int height, int fps)
 {
-    // This table prefers 16:10 resolutions because they are
-    // only slightly more pixels than the 16:9 equivalents, so
-    // we don't want to bump those 16:10 resolutions up to the
-    // next 16:9 slot.
+    // Don't scale bitrate linearly beyond 60 FPS. It's definitely not a linear
+    // bitrate increase for frame rate once we get to values that high.
+    float frameRateFactor = (fps <= 60 ? fps : (qSqrt(fps / 60.f) * 60.f)) / 30.f;
 
-    if (width * height <= 640 * 360) {
-        return static_cast<int>(1000 * (fps / 30.0));
+    // TODO: Collect some empirical data to see if these defaults make sense.
+    // We're just using the values that the Shield used, as we have for years.
+    static const struct resTable
+    {
+        int pixels;
+        int factor;
+    } resTable[]{
+        {640 * 360, 1},
+        {854 * 480, 2},
+        {1280 * 720, 5},
+        {1920 * 1080, 10},
+        {2560 * 1440, 20},
+        {3840 * 2160, 40},
+        {-1, -1},
+    };
+
+    // Calculate the resolution factor by linear interpolation of the resolution table
+    float resolutionFactor;
+    int pixels = width * height;
+    for (int i = 0;; i++)
+    {
+        if (pixels == resTable[i].pixels)
+        {
+            // We can bail immediately for exact matches
+            resolutionFactor = resTable[i].factor;
+            break;
+        }
+        else if (pixels < resTable[i].pixels)
+        {
+            if (i == 0)
+            {
+                // Never go below the lowest resolution entry
+                resolutionFactor = resTable[i].factor;
+            }
+            else
+            {
+                // Interpolate between the entry greater than the chosen resolution (i) and the entry less than the chosen resolution (i-1)
+                resolutionFactor = ((float)(pixels - resTable[i - 1].pixels) / (resTable[i].pixels - resTable[i - 1].pixels)) * (resTable[i].factor - resTable[i - 1].factor) + resTable[i - 1].factor;
+            }
+            break;
+        }
+        else if (resTable[i].pixels == -1)
+        {
+            // Never go above the highest resolution entry
+            resolutionFactor = resTable[i - 1].factor;
+            break;
+        }
     }
-    else if (width * height <= 854 * 480) {
-        return static_cast<int>(1500 * (fps / 30.0));
-    }
-    // This covers 1280x720 and 1280x800 too
-    else if (width * height <= 1366 * 768) {
-        return static_cast<int>(5000 * (fps / 30.0));
-    }
-    else if (width * height <= 1920 * 1200) {
-        return static_cast<int>(10000 * (fps / 30.0));
-    }
-    else if (width * height <= 2560 * 1600) {
-        return static_cast<int>(20000 * (fps / 30.0));
-    }
-    else /* if (width * height <= 3840 * 2160) */ {
-        return static_cast<int>(40000 * (fps / 30.0));
-    }
+
+    return qRound(resolutionFactor * frameRateFactor) * 1000;
 }

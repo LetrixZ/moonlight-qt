@@ -1,6 +1,7 @@
 import QtQuick 2.9
 import QtQuick.Controls 2.2
 import QtQuick.Layouts 1.2
+import QtQuick.Window 2.2
 
 import StreamingPreferences 1.0
 import ComputerManager 1.0
@@ -11,6 +12,8 @@ Flickable {
     id: settingsPage
     objectName: qsTr("Settings")
 
+    signal languageChanged()
+
     boundsBehavior: Flickable.OvershootBounds
 
     contentWidth: settingsColumn1.width > settingsColumn2.width ? settingsColumn1.width : settingsColumn2.width
@@ -20,6 +23,49 @@ Flickable {
         anchors {
             left: parent.right
             leftMargin: -10
+        }
+    }
+
+    function isChildOfFlickable(item) {
+        while (item) {
+            if (item.parent === contentItem) {
+                return true
+            }
+
+            item = item.parent
+        }
+        return false
+    }
+
+    NumberAnimation on contentY {
+        id: autoScrollAnimation
+        duration: 100
+    }
+
+    Window.onActiveFocusItemChanged: {
+        var item = Window.activeFocusItem
+        if (item) {
+            // Ignore non-child elements like the toolbar buttons
+            if (!isChildOfFlickable(item)) {
+                return
+            }
+
+            // Map the focus item's position into our content item's coordinate space
+            var pos = item.mapToItem(contentItem, 0, 0)
+
+            // Ensure some extra space is visible around the element we're scrolling to
+            var scrollMargin = height > 100 ? 50 : 0
+
+            if (pos.y - scrollMargin < contentY) {
+                autoScrollAnimation.from = contentY
+                autoScrollAnimation.to = Math.max(pos.y - scrollMargin, 0)
+                autoScrollAnimation.start()
+            }
+            else if (pos.y + item.height + scrollMargin > contentY + height) {
+                autoScrollAnimation.from = contentY
+                autoScrollAnimation.to = Math.min(pos.y + item.height + scrollMargin - height, contentHeight - height)
+                autoScrollAnimation.start()
+            }
         }
     }
 
@@ -214,50 +260,39 @@ Flickable {
                             // Add native resolutions for all attached displays
                             var done = false
                             for (var displayIndex = 0; !done; displayIndex++) {
-                                for (var displayResIndex = 0; displayResIndex < 2; displayResIndex++) {
-                                    var screenRect;
+                                var screenRect = SystemProperties.getNativeResolution(displayIndex);
 
-                                    // Some platforms have different desktop resolutions
-                                    // and native resolutions (like macOS with Retina displays)
-                                    if (displayResIndex === 0) {
-                                        screenRect = SystemProperties.getDesktopResolution(displayIndex)
-                                    }
-                                    else {
-                                        screenRect = SystemProperties.getNativeResolution(displayIndex)
-                                    }
+                                if (screenRect.width === 0) {
+                                    // Exceeded max count of displays
+                                    done = true
+                                    break
+                                }
 
-                                    if (screenRect.width === 0) {
-                                        // Exceeded max count of displays
-                                        done = true
+                                var indexToAdd = 0
+                                for (var j = 0; j < resolutionComboBox.count; j++) {
+                                    var existing_width = parseInt(resolutionListModel.get(j).video_width);
+                                    var existing_height = parseInt(resolutionListModel.get(j).video_height);
+
+                                    if (screenRect.width === existing_width && screenRect.height === existing_height) {
+                                        // Duplicate entry, skip
+                                        indexToAdd = -1
                                         break
                                     }
-
-                                    var indexToAdd = 0
-                                    for (var j = 0; j < resolutionComboBox.count; j++) {
-                                        var existing_width = parseInt(resolutionListModel.get(j).video_width);
-                                        var existing_height = parseInt(resolutionListModel.get(j).video_height);
-
-                                        if (screenRect.width === existing_width && screenRect.height === existing_height) {
-                                            // Duplicate entry, skip
-                                            indexToAdd = -1
-                                            break
-                                        }
-                                        else if (screenRect.width * screenRect.height > existing_width * existing_height) {
-                                            // Candidate entrypoint after this entry
-                                            indexToAdd = j + 1
-                                        }
+                                    else if (screenRect.width * screenRect.height > existing_width * existing_height) {
+                                        // Candidate entrypoint after this entry
+                                        indexToAdd = j + 1
                                     }
+                                }
 
-                                    // Insert this display's resolution if it's not a duplicate
-                                    if (indexToAdd >= 0) {
-                                        resolutionListModel.insert(indexToAdd,
-                                                                   {
-                                                                       "text": "Native ("+screenRect.width+"x"+screenRect.height+")",
-                                                                       "video_width": ""+screenRect.width,
-                                                                       "video_height": ""+screenRect.height,
-                                                                       "is_custom": false
-                                                                   })
-                                    }
+                                // Insert this display's resolution if it's not a duplicate
+                                if (indexToAdd >= 0) {
+                                    resolutionListModel.insert(indexToAdd,
+                                                               {
+                                                                   "text": "Native ("+screenRect.width+"x"+screenRect.height+")",
+                                                                   "video_width": ""+screenRect.width,
+                                                                   "video_height": ""+screenRect.height,
+                                                                   "is_custom": false
+                                                               })
                                 }
                             }
 
@@ -464,7 +499,7 @@ Flickable {
                                         maximumLength: 5
                                         inputMethodHints: Qt.ImhDigitsOnly
                                         placeholderText: resolutionListModel.get(resolutionComboBox.currentIndex).video_width
-                                        validator: IntValidator{bottom:128; top:8192}
+                                        validator: IntValidator{bottom:256; top:8192}
                                         focus: true
 
                                         onTextChanged: {
@@ -493,7 +528,7 @@ Flickable {
                                         maximumLength: 5
                                         inputMethodHints: Qt.ImhDigitsOnly
                                         placeholderText: resolutionListModel.get(resolutionComboBox.currentIndex).video_height
-                                        validator: IntValidator{bottom:128; top:8192}
+                                        validator: IntValidator{bottom:256; top:8192}
 
                                         onTextChanged: {
                                             // standardButton() was added in Qt 5.10, so we must check for it first
@@ -516,84 +551,11 @@ Flickable {
                     }
 
                     AutoResizingComboBox {
-                        function createModel() {
-                            var fpsListModel = Qt.createQmlObject('import QtQuick 2.0; ListModel {}', parent, '')
+                        property int lastIndexValue
 
-                            var max_fps = SystemProperties.maximumStreamingFrameRate
-
-                            // Default entries
-                            fpsListModel.append({"text": qsTr("%1 FPS").arg("30"), "video_fps": "30"})
-                            fpsListModel.append({"text": qsTr("%1 FPS").arg("60"), "video_fps": "60"})
-
-                            // Add unsupported FPS values that come before the display max FPS
-                            if (StreamingPreferences.unsupportedFps) {
-                                if (max_fps > 90) {
-                                    fpsListModel.append({"text": qsTr("%1 FPS (Unsupported)").arg("90"), "video_fps": "90"})
-                                }
-                                if (max_fps > 120) {
-                                    fpsListModel.append({"text": qsTr("%1 FPS (Unsupported)").arg("120"), "video_fps": "120"})
-                                }
-                            }
-
-                            // Use 64 as the cutoff for adding a separate option to
-                            // handle wonky displays that report just over 60 Hz.
-                            if (max_fps > 64) {
-                                // Mark any FPS value greater than 120 as unsupported
-                                if (StreamingPreferences.unsupportedFps && max_fps > 120) {
-                                    fpsListModel.append({"text": qsTr("%1 FPS (Unsupported)").arg(max_fps), "video_fps": ""+max_fps})
-                                }
-                                else if (max_fps > 120) {
-                                    fpsListModel.append({"text": qsTr("%1 FPS").arg("120"), "video_fps": "120"})
-                                }
-                                else {
-                                    fpsListModel.append({"text": qsTr("%1 FPS").arg(max_fps), "video_fps": ""+max_fps})
-                                }
-                            }
-
-                            // Add unsupported FPS values that come after the display max FPS
-                            if (StreamingPreferences.unsupportedFps) {
-                                if (max_fps < 90) {
-                                    fpsListModel.append({"text":qsTr("%1 FPS (Unsupported)").arg("90"), "video_fps": "90"})
-                                }
-                                if (max_fps < 120) {
-                                    fpsListModel.append({"text":qsTr("%1 FPS (Unsupported)").arg("120"), "video_fps": "120"})
-                                }
-                            }
-
-                            return fpsListModel
-                        }
-
-                        function reinitialize() {
-                            model = createModel()
-
-                            var saved_fps = StreamingPreferences.fps
-                            currentIndex = 0
-                            for (var i = 0; i < model.count; i++) {
-                                var el_fps = parseInt(model.get(i).video_fps);
-
-                                // Pick the highest value lesser or equal to the saved FPS
-                                if (saved_fps >= el_fps) {
-                                    currentIndex = i
-                                }
-                            }
-
-                            // Persist the selected value
-                            activated(currentIndex)
-                        }
-
-                        // ignore setting the index at first, and actually set it when the component is loaded
-                        Component.onCompleted: {
-                            reinitialize()
-                        }
-
-                        id: fpsComboBox
-                        maximumWidth: parent.width / 2
-                        textRole: "text"
-                        // ::onActivated must be used, as it only listens for when the index is changed by a human
-                        onActivated : {
-                            var selectedFps = parseInt(model.get(currentIndex).video_fps)
-
+                        function updateBitrateForSelection() {
                             // Only modify the bitrate if the values actually changed
+                            var selectedFps = parseInt(model.get(fpsComboBox.currentIndex).video_fps)
                             if (StreamingPreferences.fps !== selectedFps) {
                                 StreamingPreferences.fps = selectedFps
 
@@ -601,6 +563,211 @@ Flickable {
                                                                                                           StreamingPreferences.height,
                                                                                                           StreamingPreferences.fps);
                                 slider.value = StreamingPreferences.bitrateKbps
+                            }
+
+                            lastIndexValue = currentIndex
+                        }
+
+                        NavigableDialog {
+                            function isInputValid() {
+                                // If we have text that isn't valid, reject the input.
+                                if (!fpsField.acceptableInput && fpsField.text) {
+                                    return false
+                                }
+
+                                // The textbox needs to have text or placeholder text
+                                if (!fpsField.text && !fpsField.placeholderText) {
+                                    return false
+                                }
+
+                                return true
+                            }
+
+                            id: customFpsDialog
+                            standardButtons: Dialog.Ok | Dialog.Cancel
+                            onOpened: {
+                                // Force keyboard focus on the textbox so keyboard navigation works
+                                fpsField.forceActiveFocus()
+
+                                // standardButton() was added in Qt 5.10, so we must check for it first
+                                if (customFpsDialog.standardButton) {
+                                    customFpsDialog.standardButton(Dialog.Ok).enabled = customFpsDialog.isInputValid()
+                                }
+                            }
+
+                            onClosed: {
+                                fpsField.clear()
+                            }
+
+                            onRejected: {
+                                fpsComboBox.currentIndex = fpsComboBox.lastIndexValue
+                            }
+
+                            onAccepted: {
+                                // Reject if there's invalid input
+                                if (!isInputValid()) {
+                                    reject()
+                                    return
+                                }
+
+                                var fps = fpsField.text ? fpsField.text : fpsField.placeholderText
+
+                                // Find and update the custom entry
+                                for (var i = 0; i < fpsListModel.count; i++) {
+                                    if (fpsListModel.get(i).is_custom) {
+                                        fpsListModel.setProperty(i, "video_fps", fps)
+                                        fpsListModel.setProperty(i, "text", qsTr("Custom (%1 FPS)").arg(fps))
+
+                                        // Now update the bitrate using the custom resolution
+                                        fpsComboBox.currentIndex = i
+                                        fpsComboBox.updateBitrateForSelection()
+
+                                        // Update the combobox width too
+                                        fpsComboBox.recalculateWidth()
+                                        break
+                                    }
+                                }
+                            }
+
+                            ColumnLayout {
+                                Label {
+                                    text: qsTr("Enter a custom frame rate:")
+                                    font.bold: true
+                                }
+
+                                RowLayout {
+                                    TextField {
+                                        id: fpsField
+                                        maximumLength: 4
+                                        inputMethodHints: Qt.ImhDigitsOnly
+                                        placeholderText: fpsListModel.get(fpsComboBox.currentIndex).video_fps
+                                        validator: IntValidator{bottom:10; top:9999}
+                                        focus: true
+
+                                        onTextChanged: {
+                                            // standardButton() was added in Qt 5.10, so we must check for it first
+                                            if (customFpsDialog.standardButton) {
+                                                customFpsDialog.standardButton(Dialog.Ok).enabled = customFpsDialog.isInputValid()
+                                            }
+                                        }
+
+                                        Keys.onReturnPressed: {
+                                            customFpsDialog.accept()
+                                        }
+
+                                        Keys.onEnterPressed: {
+                                            customFpsDialog.accept()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        function addRefreshRateOrdered(fpsListModel, refreshRate, description, custom) {
+                            var indexToAdd = 0
+                            for (var j = 0; j < fpsListModel.count; j++) {
+                                var existing_fps = parseInt(fpsListModel.get(j).video_fps);
+
+                                if (refreshRate === existing_fps || (custom && fpsListModel.get(j).is_custom)) {
+                                    // Duplicate entry, skip
+                                    indexToAdd = -1
+                                    break
+                                }
+                                else if (refreshRate > existing_fps) {
+                                    // Candidate entrypoint after this entry
+                                    indexToAdd = j + 1
+                                }
+                            }
+
+                            // Insert this frame rate if it's not a duplicate
+                            if (indexToAdd >= 0) {
+                                // Custom values always go at the end of the list
+                                if (custom) {
+                                    indexToAdd = fpsListModel.count
+                                }
+
+                                fpsListModel.insert(indexToAdd,
+                                                    {
+                                                        "text": description,
+                                                        "video_fps": ""+refreshRate,
+                                                        "is_custom": custom
+                                                    })
+                            }
+
+                            return indexToAdd
+                        }
+
+                        function reinitialize() {
+                            // Add native refresh rate for all attached displays
+                            var done = false
+                            for (var displayIndex = 0; !done; displayIndex++) {
+                                var refreshRate = SystemProperties.getRefreshRate(displayIndex);
+                                if (refreshRate === 0) {
+                                    // Exceeded max count of displays
+                                    done = true
+                                    break
+                                }
+
+                                addRefreshRateOrdered(fpsListModel, refreshRate, qsTr("%1 FPS").arg(refreshRate), false)
+                            }
+
+                            var saved_fps = StreamingPreferences.fps
+                            var found = false
+                            for (var i = 0; i < model.count; i++) {
+                                var el_fps = parseInt(model.get(i).video_fps);
+
+                                // Look for a matching frame rate
+                                if (saved_fps === el_fps) {
+                                    currentIndex = i
+                                    found = true
+                                    break
+                                }
+                            }
+
+                            // If we didn't find one, add a custom frame rate for the current value
+                            if (!found) {
+                                currentIndex = addRefreshRateOrdered(model, saved_fps, qsTr("Custom (%1 FPS)").arg(saved_fps), true)
+                            }
+                            else {
+                                addRefreshRateOrdered(model, "", qsTr("Custom"), true)
+                            }
+
+                            recalculateWidth()
+
+                            lastIndexValue = currentIndex
+                        }
+
+                        // ignore setting the index at first, and actually set it when the component is loaded
+                        Component.onCompleted: {
+                            reinitialize()
+                            languageChanged.connect(reinitialize)
+                        }
+
+                        model: ListModel {
+                            id: fpsListModel
+                            // Other elements may be added at runtime
+                            ListElement {
+                                text: qsTr("30 FPS")
+                                video_fps: "30"
+                                is_custom: false
+                            }
+                            ListElement {
+                                text: qsTr("60 FPS")
+                                video_fps: "60"
+                                is_custom: false
+                            }
+                        }
+
+                        id: fpsComboBox
+                        maximumWidth: parent.width / 2
+                        textRole: "text"
+                        // ::onActivated must be used, as it only listens for when the index is changed by a human
+                        onActivated : {
+                            if (model.get(currentIndex).is_custom) {
+                                customFpsDialog.open()
+                            }
+                            else {
+                                updateBitrateForSelection()
                             }
                         }
                     }
@@ -638,6 +805,11 @@ Flickable {
                         bitrateTitle.text = qsTr("Video bitrate: %1 Mbps").arg(value / 1000.0)
                         StreamingPreferences.bitrateKbps = value
                     }
+
+                    Component.onCompleted: {
+                        // Refresh the text after translations change
+                        languageChanged.connect(onValueChanged)
+                    }
                 }
 
                 Label {
@@ -650,28 +822,53 @@ Flickable {
                 }
 
                 AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
+                    function createModel() {
+                        var model = Qt.createQmlObject('import QtQuick 2.0; ListModel {}', parent, '')
+
+                        model.append({
+                                         text: qsTr("Fullscreen"),
+                                         val: StreamingPreferences.WM_FULLSCREEN
+                                     })
+
+                        model.append({
+                                         text: qsTr("Borderless windowed"),
+                                         val: StreamingPreferences.WM_FULLSCREEN_DESKTOP
+                                     })
+
+                        model.append({
+                                         text: qsTr("Windowed"),
+                                         val: StreamingPreferences.WM_WINDOWED
+                                     })
+
+
+                        // Set the recommended option based on the OS
+                        for (var i = 0; i < model.count; i++) {
+                            var thisWm = model.get(i).val;
+                            if (thisWm === StreamingPreferences.recommendedFullScreenMode) {
+                                model.get(i).text += " " + qsTr("(Recommended)")
+                                model.move(i, 0, 1)
+                                break
+                            }
+                        }
+
+                        return model
+                    }
+
+
+                    // This is used on initialization and upon retranslation
+                    function reinitialize() {
                         if (!visible) {
                             // Do nothing if the control won't even be visible
                             return
                         }
 
-                        // Set the recommended option based on the OS
-                        for (var i = 0; i < windowModeListModel.count; i++) {
-                             var thisWm = windowModeListModel.get(i).val;
-                             if (thisWm === StreamingPreferences.recommendedFullScreenMode) {
-                                 windowModeListModel.get(i).text += qsTr(" (Recommended)")
-                                 windowModeListModel.move(i, 0, 1);
-                                 break
-                             }
-                        }
-
+                        model = createModel()
                         currentIndex = 0
 
+                        // Set the current value based on the saved preferences
                         var savedWm = StreamingPreferences.windowMode
-                        for (var i = 0; i < windowModeListModel.count; i++) {
-                             var thisWm = windowModeListModel.get(i).val;
+                        for (var i = 0; i < model.count; i++) {
+                             var thisWm = model.get(i).val;
                              if (savedWm === thisWm) {
                                  currentIndex = i
                                  break
@@ -681,28 +878,18 @@ Flickable {
                         activated(currentIndex)
                     }
 
+                    Component.onCompleted: {
+                        reinitialize()
+                        languageChanged.connect(reinitialize)
+                    }
+
                     id: windowModeComboBox
                     visible: SystemProperties.hasDesktopEnvironment
                     enabled: !SystemProperties.rendererAlwaysFullScreen
                     hoverEnabled: true
                     textRole: "text"
-                    model: ListModel {
-                        id: windowModeListModel
-                        ListElement {
-                            text: qsTr("Fullscreen")
-                            val: StreamingPreferences.WM_FULLSCREEN
-                        }
-                        ListElement {
-                            text: qsTr("Borderless windowed")
-                            val: StreamingPreferences.WM_FULLSCREEN_DESKTOP
-                        }
-                        ListElement {
-                            text: qsTr("Windowed")
-                            val: StreamingPreferences.WM_WINDOWED
-                        }
-                    }
                     onActivated: {
-                        StreamingPreferences.windowMode = windowModeListModel.get(currentIndex).val
+                        StreamingPreferences.windowMode = model.get(currentIndex).val
                     }
 
                     ToolTip.delay: 1000
@@ -885,7 +1072,7 @@ Flickable {
                             val: StreamingPreferences.LANG_AUTO
                         }
                         ListElement {
-                            text: "Deutsch" //German
+                            text: "Deutsch" // German
                             val: StreamingPreferences.LANG_DE
                         }
                         ListElement {
@@ -893,11 +1080,11 @@ Flickable {
                             val: StreamingPreferences.LANG_EN
                         }
                         ListElement {
-                            text: "Français" //French
+                            text: "Français" // French
                             val: StreamingPreferences.LANG_FR
                         }
                         ListElement {
-                            text: "简体中文" //Simplified Chinese
+                            text: "简体中文" // Simplified Chinese
                             val: StreamingPreferences.LANG_ZH_CN
                         }
                         ListElement {
@@ -908,11 +1095,10 @@ Flickable {
                             text: "русский" // Russian
                             val: StreamingPreferences.LANG_RU
                         }
-                        // Don't list Spanish until it is more complete
-                        /*ListElement {
+                        ListElement {
                             text: "Español" // Spanish
                             val: StreamingPreferences.LANG_ES
-                        }*/
+                        }
                         ListElement {
                             text: "日本語" // Japanese
                             val: StreamingPreferences.LANG_JA
@@ -921,6 +1107,70 @@ Flickable {
                             text: "Tiếng Việt" // Vietnamese
                             val: StreamingPreferences.LANG_VI
                         }
+                        ListElement {
+                            text: "ภาษาไทย" // Thai
+                            val: StreamingPreferences.LANG_TH
+                        }
+                        ListElement {
+                            text: "한국어" // Korean
+                            val: StreamingPreferences.LANG_KO
+                        }
+                        /* ListElement {
+                            text: "Magyar" // Hungarian
+                            val: StreamingPreferences.LANG_HU
+                        } */
+                        ListElement {
+                            text: "Nederlands" // Dutch
+                            val: StreamingPreferences.LANG_NL
+                        }
+                        ListElement {
+                            text: "Svenska" // Swedish
+                            val: StreamingPreferences.LANG_SV
+                        }
+                        /* ListElement {
+                            text: "Türkçe" // Turkish
+                            val: StreamingPreferences.LANG_TR
+                        } */
+                        /* ListElement {
+                            text: "Українська" // Ukrainian
+                            val: StreamingPreferences.LANG_UK
+                        } */
+                        ListElement {
+                            text: "繁體中文" // Traditional Chinese
+                            val: StreamingPreferences.LANG_ZH_TW
+                        }
+                        ListElement {
+                            text: "Português" // Portuguese
+                            val: StreamingPreferences.LANG_PT
+                        }
+                        /* ListElement {
+                            text: "Português do Brasil" // Brazilian Portuguese
+                            val: StreamingPreferences.LANG_PT_BR
+                        } */
+                        ListElement {
+                            text: "Ελληνικά" // Greek
+                            val: StreamingPreferences.LANG_EL
+                        }
+                        ListElement {
+                            text: "Italiano" // Italian
+                            val: StreamingPreferences.LANG_IT
+                        }
+                        /* ListElement {
+                            text: "हिन्दी, हिंदी" // Hindi
+                            val: StreamingPreferences.LANG_HI
+                        } */
+                        ListElement {
+                            text: "Język polski" // Polish
+                            val: StreamingPreferences.LANG_PL
+                        }
+                        ListElement {
+                            text: "Čeština" // Czech
+                            val: StreamingPreferences.LANG_CS
+                        }
+                        /* ListElement {
+                            text: "עִבְרִית" // Hebrew
+                            val: StreamingPreferences.LANG_HE
+                        } */
                     }
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated : {
@@ -935,6 +1185,9 @@ Flickable {
                                 // Force the back operation to pop any AppView pages that exist.
                                 // The AppView stops working after retranslate() for some reason.
                                 window.clearOnBack = true
+
+                                // Signal other controls to adjust their text
+                                languageChanged()
                             }
                         }
                     }
@@ -1020,6 +1273,22 @@ Flickable {
                     ToolTip.timeout: 5000
                     ToolTip.visible: hovered
                     ToolTip.text: qsTr("Updates your Discord status to display the name of the game you're streaming.")
+                }
+
+                CheckBox {
+                    id: keepAwakeCheck
+                    width: parent.width
+                    text: qsTr("Keep the display awake while streaming")
+                    font.pointSize: 12
+                    checked: StreamingPreferences.keepAwake
+                    onCheckedChanged: {
+                        StreamingPreferences.keepAwake = checked
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("Prevents the screensaver from starting or the display from going to sleep while streaming.")
                 }
             }
         }
@@ -1340,6 +1609,7 @@ Flickable {
 
                     id: decoderComboBox
                     textRole: "text"
+                    enabled: !enableHdr.checked
                     model: ListModel {
                         id: decoderListModel
                         ListElement {
@@ -1356,9 +1626,26 @@ Flickable {
                         }
                     }
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated : {
-                        StreamingPreferences.videoDecoderSelection = decoderListModel.get(currentIndex).val
+                    onActivated: {
+                        if (enabled) {
+                            StreamingPreferences.videoDecoderSelection = decoderListModel.get(currentIndex).val
+                        }
                     }
+
+                    // This handles the state of the enableHdr checkbox changing
+                    onEnabledChanged: {
+                        if (enabled) {
+                            StreamingPreferences.videoDecoderSelection = decoderListModel.get(currentIndex).val
+                        }
+                        else {
+                            StreamingPreferences.videoDecoderSelection = StreamingPreferences.VDS_AUTO
+                        }
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered && !enabled
+                    ToolTip.text: qsTr("Enabling HDR overrides manual decoder selections.")
                 }
 
                 Label {
@@ -1373,7 +1660,11 @@ Flickable {
                     // ignore setting the index at first, and actually set it when the component is loaded
                     Component.onCompleted: {
                         var saved_vcc = StreamingPreferences.videoCodecConfig
+
+                        // Default to Automatic (relevant if HDR is enabled,
+                        // where we will match none of the codecs in the list)
                         currentIndex = 0
+
                         for(var i = 0; i < codecListModel.count; i++) {
                             var el_vcc = codecListModel.get(i).val;
                             if (saved_vcc === el_vcc) {
@@ -1381,6 +1672,7 @@ Flickable {
                                 break
                             }
                         }
+
                         activated(currentIndex)
                     }
 
@@ -1400,34 +1692,40 @@ Flickable {
                             text: qsTr("HEVC (H.265)")
                             val: StreamingPreferences.VCC_FORCE_HEVC
                         }
-                        /*ListElement {
-                            text: qsTr("HEVC HDR (Experimental)")
-                            val: StreamingPreferences.VCC_FORCE_HEVC_HDR
-                        }*/
+                        ListElement {
+                            text: qsTr("AV1 (Experimental)")
+                            val: StreamingPreferences.VCC_FORCE_AV1
+                        }
                     }
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
                     onActivated : {
-                        StreamingPreferences.videoCodecConfig = codecListModel.get(currentIndex).val
+                        if (enabled) {
+                            StreamingPreferences.videoCodecConfig = codecListModel.get(currentIndex).val
+                        }
                     }
                 }
 
                 CheckBox {
-                    id: unlockUnsupportedFps
+                    id: enableHdr
                     width: parent.width
-                    text: qsTr("Unlock unsupported FPS options")
+                    text: qsTr("Enable HDR (Experimental)")
                     font.pointSize: 12
-                    checked: StreamingPreferences.unsupportedFps
-                    onCheckedChanged: {
-                        // This is called on init, so only do the work if we've
-                        // actually changed the value.
-                        if (StreamingPreferences.unsupportedFps != checked) {
-                            StreamingPreferences.unsupportedFps = checked
 
-                            // The selectable FPS values depend on whether
-                            // this option is enabled or not
-                            fpsComboBox.reinitialize()
-                        }
+                    enabled: SystemProperties.supportsHdr
+                    checked: enabled && StreamingPreferences.enableHdr
+                    onCheckedChanged: {
+                        StreamingPreferences.enableHdr = checked
                     }
+
+                    // Updating StreamingPreferences.videoCodecConfig is handled above
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: enabled ?
+                                      qsTr("The stream will be HDR-capable, but some games may require an HDR monitor on your host PC to enable HDR mode.")
+                                    :
+                                      qsTr("HDR streaming is not supported on this PC.")
                 }
 
                 CheckBox {

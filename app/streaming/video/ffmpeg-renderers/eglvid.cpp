@@ -10,12 +10,10 @@
 #include <Limelight.h>
 #include <unistd.h>
 
-#include <SDL_egl.h>
-#include <SDL_opengles2.h>
 #include <SDL_render.h>
 #include <SDL_syswm.h>
 
-// These are EGL extensions, so some platform headers may not provide them
+// These are extensions, so some platform headers may not provide them
 #ifndef EGL_PLATFORM_WAYLAND_KHR
 #define EGL_PLATFORM_WAYLAND_KHR 0x31D8
 #endif
@@ -24,6 +22,9 @@
 #endif
 #ifndef EGL_PLATFORM_GBM_KHR
 #define EGL_PLATFORM_GBM_KHR 0x31D7
+#endif
+#ifndef GL_UNPACK_ROW_LENGTH_EXT
+#define GL_UNPACK_ROW_LENGTH_EXT 0x0CF2
 #endif
 
 typedef struct _OVERLAY_VERTEX
@@ -56,6 +57,7 @@ typedef struct _OVERLAY_VERTEX
         "EGLRenderer: " __VA_ARGS__)
 
 SDL_Window* EGLRenderer::s_LastFailedWindow = nullptr;
+int EGLRenderer::s_LastFailedVideoFormat = 0;
 
 EGLRenderer::EGLRenderer(IFFmpegRenderer *backendRenderer)
     :
@@ -71,14 +73,20 @@ EGLRenderer::EGLRenderer(IFFmpegRenderer *backendRenderer)
         m_Window(nullptr),
         m_Backend(backendRenderer),
         m_VAO(0),
-        m_ColorSpace(AVCOL_SPC_NB),
-        m_ColorFull(false),
         m_BlockingSwapBuffers(false),
+        m_LastRenderSync(EGL_NO_SYNC),
         m_LastFrame(av_frame_alloc()),
         m_glEGLImageTargetTexture2DOES(nullptr),
         m_glGenVertexArraysOES(nullptr),
         m_glBindVertexArrayOES(nullptr),
         m_glDeleteVertexArraysOES(nullptr),
+        m_eglCreateSync(nullptr),
+        m_eglCreateSyncKHR(nullptr),
+        m_eglDestroySync(nullptr),
+        m_eglClientWaitSync(nullptr),
+        m_GlesMajorVersion(0),
+        m_GlesMinorVersion(0),
+        m_HasExtUnpackSubimage(false),
         m_DummyRenderer(nullptr)
 {
     SDL_assert(backendRenderer);
@@ -95,6 +103,10 @@ EGLRenderer::~EGLRenderer()
     if (m_Context) {
         // Reattach the GL context to the main thread for destruction
         SDL_GL_MakeCurrent(m_Window, m_Context);
+        if (m_LastRenderSync != EGL_NO_SYNC) {
+            SDL_assert(m_eglDestroySync != nullptr);
+            m_eglDestroySync(m_EGLDisplay, m_LastRenderSync);
+        }
         if (m_ShaderProgram) {
             glDeleteProgram(m_ShaderProgram);
         }
@@ -156,6 +168,12 @@ void EGLRenderer::notifyOverlayUpdated(Overlay::OverlayType type)
     }
 }
 
+bool EGLRenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info)
+{
+    // We can transparently handle size and display changes
+    return !(info->stateChangeFlags & ~(WINDOW_STATE_CHANGE_SIZE | WINDOW_STATE_CHANGE_DISPLAY));
+}
+
 bool EGLRenderer::isPixelFormatSupported(int videoFormat, AVPixelFormat pixelFormat)
 {
     // Pixel format support should be determined by the backend renderer
@@ -168,7 +186,7 @@ AVPixelFormat EGLRenderer::getPreferredPixelFormat(int videoFormat)
     return m_Backend->getPreferredPixelFormat(videoFormat);
 }
 
-void EGLRenderer::renderOverlay(Overlay::OverlayType type)
+void EGLRenderer::renderOverlay(Overlay::OverlayType type, int viewportWidth, int viewportHeight)
 {
     // Do nothing if this overlay is disabled
     if (!Session::get()->getOverlayManager().isOverlayEnabled(type)) {
@@ -179,17 +197,38 @@ void EGLRenderer::renderOverlay(Overlay::OverlayType type)
     SDL_Surface* newSurface = Session::get()->getOverlayManager().getUpdatedOverlaySurface(type);
     if (newSurface != nullptr) {
         SDL_assert(!SDL_MUSTLOCK(newSurface));
+        SDL_assert(newSurface->format->format == SDL_PIXELFORMAT_ARGB8888);
 
         glBindTexture(GL_TEXTURE_2D, m_OverlayTextures[type]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, newSurface->w, newSurface->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, newSurface->pixels);
 
-        // SDL_FRect wasn't added until 2.0.10
-        struct {
-            float x;
-            float y;
-            float w;
-            float h;
-        } overlayRect = {};
+        void* packedPixelData = nullptr;
+        if (m_GlesMajorVersion >= 3 || m_HasExtUnpackSubimage) {
+            // If we are GLES 3.0+ or have GL_EXT_unpack_subimage, GL can handle any pitch
+            SDL_assert(newSurface->pitch % newSurface->format->BytesPerPixel == 0);
+            glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, newSurface->pitch / newSurface->format->BytesPerPixel);
+        }
+        else if (newSurface->pitch != newSurface->w * newSurface->format->BytesPerPixel) {
+            // If we can't use GL_UNPACK_ROW_LENGTH and the surface isn't tightly packed,
+            // we must allocate a tightly packed buffer and copy our pixels there.
+            packedPixelData = malloc(newSurface->w * newSurface->h * newSurface->format->BytesPerPixel);
+            if (!packedPixelData) {
+                SDL_FreeSurface(newSurface);
+                return;
+            }
+
+            SDL_ConvertPixels(newSurface->w, newSurface->h,
+                              newSurface->format->format, newSurface->pixels, newSurface->pitch,
+                              newSurface->format->format, packedPixelData, newSurface->w * newSurface->format->BytesPerPixel);
+        }
+
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, newSurface->w, newSurface->h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     packedPixelData ? packedPixelData : newSurface->pixels);
+
+        if (packedPixelData) {
+            free(packedPixelData);
+        }
+
+        SDL_FRect overlayRect;
 
         // These overlay positions differ from the other renderers because OpenGL
         // places the origin in the lower-left corner instead of the upper-left.
@@ -201,7 +240,7 @@ void EGLRenderer::renderOverlay(Overlay::OverlayType type)
         else if (type == Overlay::OverlayDebug) {
             // Top left
             overlayRect.x = 0;
-            overlayRect.y = m_ViewportHeight - newSurface->h;
+            overlayRect.y = viewportHeight - newSurface->h;
         } else {
             SDL_assert(false);
         }
@@ -212,12 +251,7 @@ void EGLRenderer::renderOverlay(Overlay::OverlayType type)
         SDL_FreeSurface(newSurface);
 
         // Convert screen space to normalized device coordinates
-        overlayRect.x /= m_ViewportWidth / 2;
-        overlayRect.w /= m_ViewportWidth / 2;
-        overlayRect.y /= m_ViewportHeight / 2;
-        overlayRect.h /= m_ViewportHeight / 2;
-        overlayRect.x -= 1.0f;
-        overlayRect.y -= 1.0f;
+        StreamUtils::screenSpaceToNormalizedDeviceCoords(&overlayRect, viewportWidth, viewportHeight);
 
         OVERLAY_VERTEX verts[] =
         {
@@ -373,7 +407,7 @@ bool EGLRenderer::compileShaders() {
     SDL_assert(m_EGLImagePixelFormat != AV_PIX_FMT_NONE);
 
     // XXX: TODO: other formats
-    if (m_EGLImagePixelFormat == AV_PIX_FMT_NV12) {
+    if (m_EGLImagePixelFormat == AV_PIX_FMT_NV12 || m_EGLImagePixelFormat == AV_PIX_FMT_P010) {
         m_ShaderProgram = compileShader("egl_nv12.vert", "egl_nv12.frag");
         if (!m_ShaderProgram) {
             return false;
@@ -414,11 +448,6 @@ bool EGLRenderer::initialize(PDECODER_PARAMETERS params)
 {
     m_Window = params->window;
 
-    if (params->videoFormat == VIDEO_FORMAT_H265_MAIN10) {
-        // EGL doesn't support rendering YUV 10-bit textures yet
-        return false;
-    }
-
     // It's not safe to attempt to opportunistically create a GLES2
     // renderer prior to 2.0.10. If GLES2 isn't available, SDL will
     // attempt to dereference a null pointer and crash Moonlight.
@@ -429,18 +458,27 @@ bool EGLRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
+    // This renderer doesn't support HDR, so pick a different one.
+    // HACK: This avoids a deadlock in SDL_CreateRenderer() if
+    // Vulkan was used before and SDL is trying to load EGL.
+    if (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) {
+        EGL_LOG(Info, "EGL doesn't support HDR rendering");
+        return false;
+    }
+
     // HACK: Work around bug where renderer will repeatedly fail with:
     // SDL_CreateRenderer() failed: Could not create GLES window surface
+    // Don't retry if we've already failed to create a renderer for this
+    // window *unless* the format has changed from 10-bit to 8-bit.
     if (m_Window == s_LastFailedWindow) {
         EGL_LOG(Error, "SDL_CreateRenderer() already failed on this window!");
         return false;
     }
 
-    /*
-     * Create a dummy renderer in order to craft an accelerated SDL Window.
-     * Request opengl ES 3.0 context, otherwise it will SIGSEGV
-     * https://gitlab.freedesktop.org/mesa/mesa/issues/1011
-     */
+    // This hint will ensure we use EGL to retrieve our GL context,
+    // even on X11 where that is not the default. EGL is required
+    // to avoid a crash in Mesa.
+    // https://gitlab.freedesktop.org/mesa/mesa/issues/1011
     SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1");
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -464,9 +502,34 @@ bool EGLRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-    if (!(m_DummyRenderer = SDL_CreateRenderer(m_Window, renderIndex, SDL_RENDERER_ACCELERATED))) {
+    m_DummyRenderer = SDL_CreateRenderer(m_Window, renderIndex, SDL_RENDERER_ACCELERATED);
+    if (!m_DummyRenderer) {
+        // Print the error here (before it gets clobbered), but ensure that we flush window
+        // events just in case SDL re-created the window before eventually failing.
         EGL_LOG(Error, "SDL_CreateRenderer() failed: %s", SDL_GetError());
+    }
+
+    // SDL_CreateRenderer() can end up having to recreate our window (SDL_RecreateWindow())
+    // to ensure it's compatible with the renderer's OpenGL context. If that happens, we
+    // can get spurious SDL_WINDOWEVENT events that will cause us to (again) recreate our
+    // renderer. This can lead to an infinite to renderer recreation, so discard all
+    // SDL_WINDOWEVENT events after SDL_CreateRenderer().
+    Session* session = Session::get();
+    if (session != nullptr) {
+        // If we get here during a session, we need to synchronize with the event loop
+        // to ensure we don't drop any important events.
+        session->flushWindowEvents();
+    }
+    else {
+        // If we get here prior to the start of a session, just pump and flush ourselves.
+        SDL_PumpEvents();
+        SDL_FlushEvent(SDL_WINDOWEVENT);
+    }
+
+    // Now we finally bail if we failed during SDL_CreateRenderer() above.
+    if (!m_DummyRenderer) {
         s_LastFailedWindow = m_Window;
+        s_LastFailedVideoFormat = params->videoFormat;
         return false;
     }
 
@@ -517,6 +580,23 @@ bool EGLRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
+    {
+        int r, g, b, a;
+        SDL_GL_GetAttribute(SDL_GL_RED_SIZE, &r);
+        SDL_GL_GetAttribute(SDL_GL_GREEN_SIZE, &g);
+        SDL_GL_GetAttribute(SDL_GL_BLUE_SIZE, &b);
+        SDL_GL_GetAttribute(SDL_GL_ALPHA_SIZE, &a);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Color buffer is: R%dG%dB%dA%d",
+                    r, g, b, a);
+    }
+
+    SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &m_GlesMajorVersion);
+    SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &m_GlesMinorVersion);
+
+    // We can use GL_UNPACK_ROW_LENGTH for a more optimized upload of non-tightly-packed textures
+    m_HasExtUnpackSubimage = SDL_GL_ExtensionSupported("GL_EXT_unpack_subimage");
+
     const EGLExtensions eglExtensions(m_EGLDisplay);
     if (!eglExtensions.isSupported("EGL_KHR_image_base") &&
         !eglExtensions.isSupported("EGL_KHR_image")) {
@@ -555,25 +635,46 @@ bool EGLRenderer::initialize(PDECODER_PARAMETERS params)
         return false;
     }
 
-    /* Compute the video region size in order to keep the aspect ratio of the
-     * video stream.
-     */
-    SDL_Rect src, dst;
-    src.x = src.y = dst.x = dst.y = 0;
-    src.w = params->width;
-    src.h = params->height;
-    SDL_GL_GetDrawableSize(m_Window, &dst.w, &dst.h);
-    StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
+    // EGL_KHR_fence_sync is an extension for EGL 1.1+
+    if (eglExtensions.isSupported("EGL_KHR_fence_sync")) {
+        // eglCreateSyncKHR() has a slightly different prototype to eglCreateSync()
+        m_eglCreateSyncKHR = (typeof(m_eglCreateSyncKHR))eglGetProcAddress("eglCreateSyncKHR");
+        m_eglDestroySync = (typeof(m_eglDestroySync))eglGetProcAddress("eglDestroySyncKHR");
+        m_eglClientWaitSync = (typeof(m_eglClientWaitSync))eglGetProcAddress("eglClientWaitSyncKHR");
+    }
+    else {
+        // EGL 1.5 introduced sync support to the core specification
+        m_eglCreateSync = (typeof(m_eglCreateSync))eglGetProcAddress("eglCreateSync");
+        m_eglDestroySync = (typeof(m_eglDestroySync))eglGetProcAddress("eglDestroySync");
+        m_eglClientWaitSync = (typeof(m_eglClientWaitSync))eglGetProcAddress("eglClientWaitSync");
+    }
 
-    glViewport(dst.x, dst.y, dst.w, dst.h);
+    if (!(m_eglCreateSync || m_eglCreateSyncKHR) || !m_eglDestroySync || !m_eglClientWaitSync) {
+        EGL_LOG(Warn, "Failed to find sync functions");
 
-    m_ViewportWidth = dst.w;
-    m_ViewportHeight = dst.h;
+        // Sub-optimal, but not fatal
+        m_eglCreateSync = nullptr;
+        m_eglCreateSyncKHR = nullptr;
+        m_eglDestroySync = nullptr;
+        m_eglClientWaitSync = nullptr;
+    }
 
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    if (params->enableVsync) {
+    // SDL always uses swap interval 0 under the hood on Wayland systems,
+    // because the compositor guarantees tear-free rendering. In this
+    // situation, swap interval > 0 behaves as a frame pacing option
+    // rather than a way to eliminate tearing as SDL will block in
+    // SwapBuffers until the compositor consumes the frame. This will
+    // needlessly increases latency, so we should avoid it.
+    //
+    // HACK: In SDL 2.0.22+ on GNOME systems with fractional DPI scaling,
+    // the Wayland viewport can be stale when using Super+Left/Right/Up
+    // to resize the window. This seems to happen significantly more often
+    // with vsync enabled, so this also mitigates that problem too.
+    if (params->enableVsync
+#ifdef SDL_VIDEO_DRIVER_WAYLAND
+            && info.subsystem != SDL_SYSWM_WAYLAND
+#endif
+            ) {
         SDL_GL_SetSwapInterval(1);
 
 #if SDL_VERSION_ATLEAST(2, 0, 15) && defined(SDL_VIDEO_DRIVER_KMSDRM)
@@ -590,7 +691,12 @@ bool EGLRenderer::initialize(PDECODER_PARAMETERS params)
         SDL_GL_SetSwapInterval(0);
     }
 
-    SDL_GL_SwapWindow(params->window);
+    if (!params->testOnly) {
+        // Draw a black frame until the video stream starts rendering
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        SDL_GL_SwapWindow(params->window);
+    }
 
     glGenTextures(EGL_MAX_PLANES, m_Textures);
     for (size_t i = 0; i < EGL_MAX_PLANES; ++i) {
@@ -621,17 +727,26 @@ bool EGLRenderer::initialize(PDECODER_PARAMETERS params)
     // Detach the context from this thread, so the render thread can attach it
     SDL_GL_MakeCurrent(m_Window, nullptr);
 
+#ifdef SDL_HINT_VIDEO_X11_FORCE_EGL
+    if (err == GL_NO_ERROR) {
+        // If we got a working GL implementation via EGL, avoid using GLX from now on.
+        // GLX will cause problems if we later want to use EGL again on this window.
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "EGL passed preflight checks. Using EGL for GL context creation.");
+        SDL_SetHint(SDL_HINT_VIDEO_X11_FORCE_EGL, "1");
+    }
+#endif
+
     return err == GL_NO_ERROR;
 }
 
-const float *EGLRenderer::getColorOffsets() {
+const float *EGLRenderer::getColorOffsets(const AVFrame* frame) {
     static const float limitedOffsets[] = { 16.0f / 255.0f, 128.0f / 255.0f, 128.0f / 255.0f };
     static const float fullOffsets[] = { 0.0f, 128.0f / 255.0f, 128.0f / 255.0f };
 
-    return m_ColorFull ? fullOffsets : limitedOffsets;
+    return isFrameFullRange(frame) ? fullOffsets : limitedOffsets;
 }
 
-const float *EGLRenderer::getColorMatrix() {
+const float *EGLRenderer::getColorMatrix(const AVFrame* frame) {
     /* The conversion matrices are shamelessly stolen from linux:
      * drivers/media/platform/imx-pxp.c:pxp_setup_csc
      */
@@ -666,38 +781,23 @@ const float *EGLRenderer::getColorMatrix() {
         1.4746f, -0.5714f, 0.0f
     };
 
-    switch (m_ColorSpace) {
-        case AVCOL_SPC_SMPTE170M:
-        case AVCOL_SPC_BT470BG:
-            return m_ColorFull ? bt601Full : bt601Lim;
-        case AVCOL_SPC_BT709:
-            return m_ColorFull ? bt709Full : bt709Lim;
-        case AVCOL_SPC_BT2020_NCL:
-        case AVCOL_SPC_BT2020_CL:
-            return m_ColorFull ? bt2020Full : bt2020Lim;
+    bool fullRange = isFrameFullRange(frame);
+    switch (getFrameColorspace(frame)) {
+        case COLORSPACE_REC_601:
+            return fullRange ? bt601Full : bt601Lim;
+        case COLORSPACE_REC_709:
+            return fullRange ? bt709Full : bt709Lim;
+        case COLORSPACE_REC_2020:
+            return fullRange ? bt2020Full : bt2020Lim;
         default:
-            // Some backends don't populate this, so we'll assume
-            // the host gave us what we asked for by default.
-            switch (getDecoderColorspace()) {
-                case COLORSPACE_REC_601:
-                    return m_ColorFull ? bt601Full : bt601Lim;
-                case COLORSPACE_REC_709:
-                    return m_ColorFull ? bt709Full : bt709Lim;
-                case COLORSPACE_REC_2020:
-                    return m_ColorFull ? bt2020Full : bt2020Lim;
-                default:
-                    SDL_assert(false);
-            }
-    };
+            SDL_assert(false);
+    }
 
     return bt601Lim;
 }
 
 bool EGLRenderer::specialize() {
     SDL_assert(!m_VAO);
-
-    // Attach our GL context to the render thread
-    SDL_GL_MakeCurrent(m_Window, m_Context);
 
     if (!compileShaders())
         return false;
@@ -750,15 +850,42 @@ bool EGLRenderer::specialize() {
     return err == GL_NO_ERROR;
 }
 
+void EGLRenderer::cleanupRenderContext()
+{
+    // Detach the context from the render thread so the destructor can attach it
+    SDL_GL_MakeCurrent(m_Window, nullptr);
+}
+
+void EGLRenderer::waitToRender()
+{
+    // Ensure our GL context is active on this thread
+    // See comment in renderFrame() for more details.
+    SDL_GL_MakeCurrent(m_Window, m_Context);
+
+    // Wait for the previous buffer swap to finish before picking the next frame to render.
+    // This way we'll get the latest available frame and render it without blocking.
+    if (m_BlockingSwapBuffers) {
+        // Try to use eglClientWaitSync() if the driver supports it
+        if (m_LastRenderSync != EGL_NO_SYNC) {
+            SDL_assert(m_eglClientWaitSync != nullptr);
+            m_eglClientWaitSync(m_EGLDisplay, m_LastRenderSync, EGL_SYNC_FLUSH_COMMANDS_BIT, EGL_FOREVER);
+        }
+        else {
+            // Use glFinish() if fences aren't available
+            glFinish();
+        }
+    }
+}
+
 void EGLRenderer::renderFrame(AVFrame* frame)
 {
     EGLImage imgs[EGL_MAX_PLANES];
 
-    if (frame == nullptr) {
-        // End of stream - unbind the GL context
-        SDL_GL_MakeCurrent(m_Window, nullptr);
-        return;
-    }
+    // Attach our GL context to the render thread
+    // NB: It should already be current, unless the SDL render event watcher
+    // performs a rendering operation (like a viewport update on resize) on
+    // our fake SDL_Renderer. If it's already current, this is a no-op.
+    SDL_GL_MakeCurrent(m_Window, m_Context);
 
     // Find the native read-back format and load the shaders
     if (m_EGLImagePixelFormat == AV_PIX_FMT_NONE) {
@@ -767,15 +894,20 @@ void EGLRenderer::renderFrame(AVFrame* frame)
 
         SDL_assert(m_EGLImagePixelFormat != AV_PIX_FMT_NONE);
 
-        m_ColorSpace = frame->colorspace;
-
-        // This handles the case where the color range is unknown,
-        // so that we use Limited color range which is the default
-        // behavior for Moonlight.
-        m_ColorFull = frame->color_range == AVCOL_RANGE_JPEG;
-
         if (!specialize()) {
             m_EGLImagePixelFormat = AV_PIX_FMT_NONE;
+
+            // Failure to specialize is fatal. We must reset the renderer
+            // to recover successfully.
+            //
+            // Note: This seems to be easy to trigger when transitioning from
+            // maximized mode by dragging the window down on GNOME 42 using
+            // XWayland. Other strategies like calling glGetError() don't seem
+            // to be able to detect this situation for some reason.
+            SDL_Event event;
+            event.type = SDL_RENDER_TARGETS_RESET;
+            SDL_PushEvent(&event);
+
             return;
         }
     }
@@ -790,13 +922,27 @@ void EGLRenderer::renderFrame(AVFrame* frame)
     }
 
     glClear(GL_COLOR_BUFFER_BIT);
+
+    int drawableWidth, drawableHeight;
+    SDL_GL_GetDrawableSize(m_Window, &drawableWidth, &drawableHeight);
+
+    // Set the viewport to the size of the aspect-ratio-scaled video
+    SDL_Rect src, dst;
+    src.x = src.y = dst.x = dst.y = 0;
+    src.w = frame->width;
+    src.h = frame->height;
+    dst.w = drawableWidth;
+    dst.h = drawableHeight;
+    StreamUtils::scaleSourceToDestinationSurface(&src, &dst);
+    glViewport(dst.x, dst.y, dst.w, dst.h);
+
     glUseProgram(m_ShaderProgram);
     m_glBindVertexArrayOES(m_VAO);
 
     // Bind parameters for the shaders
-    if (m_EGLImagePixelFormat == AV_PIX_FMT_NV12) {
-        glUniformMatrix3fv(m_ShaderProgramParams[NV12_PARAM_YUVMAT], 1, GL_FALSE, getColorMatrix());
-        glUniform3fv(m_ShaderProgramParams[NV12_PARAM_OFFSET], 1, getColorOffsets());
+    if (m_EGLImagePixelFormat == AV_PIX_FMT_NV12 || m_EGLImagePixelFormat == AV_PIX_FMT_P010) {
+        glUniformMatrix3fv(m_ShaderProgramParams[NV12_PARAM_YUVMAT], 1, GL_FALSE, getColorMatrix(frame));
+        glUniform3fv(m_ShaderProgramParams[NV12_PARAM_OFFSET], 1, getColorOffsets(frame));
         glUniform1i(m_ShaderProgramParams[NV12_PARAM_PLANE1], 0);
         glUniform1i(m_ShaderProgramParams[NV12_PARAM_PLANE2], 1);
     }
@@ -808,22 +954,38 @@ void EGLRenderer::renderFrame(AVFrame* frame)
 
     m_glBindVertexArrayOES(0);
 
+    // Adjust the viewport to the whole window before rendering the overlays
+    glViewport(0, 0, drawableWidth, drawableHeight);
     for (int i = 0; i < Overlay::OverlayMax; i++) {
-        renderOverlay((Overlay::OverlayType)i);
+        renderOverlay((Overlay::OverlayType)i, drawableWidth, drawableHeight);
     }
 
     SDL_GL_SwapWindow(m_Window);
 
     if (m_BlockingSwapBuffers) {
-        // This glClear() forces us to block until the buffer swap is
-        // complete to continue rendering. Mesa won't actually wait
-        // for the swap with just glFinish() alone. Waiting here keeps us
-        // in lock step with the display refresh rate. If we don't wait
-        // here, we'll stall on the first GL call next frame. Doing the
-        // wait here instead allows more time for a newer frame to arrive
-        // for next renderFrame() call.
+        // This glClear() requires the new back buffer to complete. This ensures
+        // our eglClientWaitSync() or glFinish() call in waitToRender() will not
+        // return before the new buffer is actually ready for rendering.
         glClear(GL_COLOR_BUFFER_BIT);
-        glFinish();
+
+        // If we this EGL implementation supports fences, use those to delay
+        // rendering the next frame until this one is completed. If not, we'll
+        // have to just use glFinish().
+        if (m_eglClientWaitSync != nullptr) {
+            // Delete the sync object from last render
+            if (m_LastRenderSync != EGL_NO_SYNC) {
+                m_eglDestroySync(m_EGLDisplay, m_LastRenderSync);
+            }
+
+            // Create a new sync object that will be signalled when the buffer swap is completed
+            if (m_eglCreateSync != nullptr) {
+                m_LastRenderSync = m_eglCreateSync(m_EGLDisplay, EGL_SYNC_FENCE, nullptr);
+            }
+            else {
+                SDL_assert(m_eglCreateSyncKHR != nullptr);
+                m_LastRenderSync = m_eglCreateSyncKHR(m_EGLDisplay, EGL_SYNC_FENCE, nullptr);
+            }
+        }
     }
 
     m_Backend->freeEGLImages(m_EGLDisplay, imgs);

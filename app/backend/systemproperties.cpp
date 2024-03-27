@@ -2,6 +2,7 @@
 #include "utils.h"
 
 #include <QGuiApplication>
+#include <QLibraryInfo>
 
 #include "streaming/session.h"
 #include "streaming/streamutils.h"
@@ -17,6 +18,7 @@ SystemProperties::SystemProperties()
     hasDesktopEnvironment = WMUtils::isRunningDesktopEnvironment();
     isRunningWayland = WMUtils::isRunningWayland();
     isRunningXWayland = isRunningWayland && QGuiApplication::platformName() == "xcb";
+    usesMaterial3Theme = QLibraryInfo::version() >= QVersionNumber(6, 5, 0);
     QString nativeArch = QSysInfo::currentCpuArchitecture();
 
 #ifdef Q_OS_WIN32
@@ -70,21 +72,20 @@ SystemProperties::SystemProperties()
     // and cache the results to speed up future queries on this data.
     querySdlVideoInfo();
 
-    Q_ASSERT(maximumStreamingFrameRate >= 60);
-    Q_ASSERT(!monitorDesktopResolutions.isEmpty());
+    Q_ASSERT(!monitorRefreshRates.isEmpty());
     Q_ASSERT(!monitorNativeResolutions.isEmpty());
-}
-
-QRect SystemProperties::getDesktopResolution(int displayIndex)
-{
-    // Returns default constructed QRect if out of bounds
-    return monitorDesktopResolutions.value(displayIndex);
 }
 
 QRect SystemProperties::getNativeResolution(int displayIndex)
 {
     // Returns default constructed QRect if out of bounds
     return monitorNativeResolutions.value(displayIndex);
+}
+
+int SystemProperties::getRefreshRate(int displayIndex)
+{
+    // Returns 0 if out of bounds
+    return monitorRefreshRates.value(displayIndex);
 }
 
 class QuerySdlVideoThread : public QThread
@@ -148,7 +149,7 @@ void SystemProperties::querySdlVideoInfoInternal()
         }
     }
 
-    Session::getDecoderInfo(testWindow, hasHardwareAcceleration, rendererAlwaysFullScreen, maximumResolution);
+    Session::getDecoderInfo(testWindow, hasHardwareAcceleration, rendererAlwaysFullScreen, supportsHdr, maximumResolution);
 
     SDL_DestroyWindow(testWindow);
 
@@ -193,35 +194,13 @@ void SystemProperties::refreshDisplaysInternal()
         return;
     }
 
-    monitorDesktopResolutions.clear();
     monitorNativeResolutions.clear();
-
-    // Never let the maximum drop below 60 FPS
-    maximumStreamingFrameRate = 60;
 
     SDL_DisplayMode bestMode;
     for (int displayIndex = 0; displayIndex < SDL_GetNumVideoDisplays(); displayIndex++) {
         SDL_DisplayMode desktopMode;
-        int err;
 
-        err = SDL_GetDesktopDisplayMode(displayIndex, &desktopMode);
-        if (err == 0) {
-            if (desktopMode.w <= 8192 && desktopMode.h <= 8192) {
-                monitorDesktopResolutions.insert(displayIndex, QRect(0, 0, desktopMode.w, desktopMode.h));
-            }
-            else {
-                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                            "Skipping resolution over 8K: %dx%d",
-                            desktopMode.w, desktopMode.h);
-            }
-        }
-        else {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "SDL_GetDesktopDisplayMode() failed: %s",
-                         SDL_GetError());
-        }
-
-        if (StreamUtils::getRealDesktopMode(displayIndex, &desktopMode)) {
+        if (StreamUtils::getNativeDesktopMode(displayIndex, &desktopMode)) {
             if (desktopMode.w <= 8192 && desktopMode.h <= 8192) {
                 monitorNativeResolutions.insert(displayIndex, QRect(0, 0, desktopMode.w, desktopMode.h));
             }
@@ -244,7 +223,17 @@ void SystemProperties::refreshDisplaysInternal()
                 }
             }
 
-            maximumStreamingFrameRate = qMax(maximumStreamingFrameRate, bestMode.refresh_rate);
+            // Try to normalize values around our our standard refresh rates.
+            // Some displays/OSes report values that are slightly off.
+            if (bestMode.refresh_rate >= 58 && bestMode.refresh_rate <= 62) {
+                monitorRefreshRates.append(60);
+            }
+            else if (bestMode.refresh_rate >= 28 && bestMode.refresh_rate <= 32) {
+                monitorRefreshRates.append(30);
+            }
+            else {
+                monitorRefreshRates.append(bestMode.refresh_rate);
+            }
         }
     }
 

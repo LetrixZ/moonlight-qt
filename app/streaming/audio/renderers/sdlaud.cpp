@@ -26,11 +26,19 @@ bool SdlAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION* 
     want.format = AUDIO_S16;
     want.channels = opusConfig->channelCount;
 
-    // This is supposed to be a power of 2, but our
-    // frames contain a non-power of 2 number of samples,
-    // so the slop would require buffering another full frame.
-    // Specifying non-Po2 seems to work for our supported platforms.
-    want.samples = opusConfig->samplesPerFrame;
+    // On PulseAudio systems, setting a value too small can cause underruns for other
+    // applications sharing this output device. We impose a floor of 480 samples (10 ms)
+    // to mitigate this issue. Otherwise, we will buffer up to 3 frames of audio which
+    // is 15 ms at regular 5 ms frames and 30 ms at 10 ms frames for slow connections.
+    // The buffering helps avoid audio underruns due to network jitter.
+#ifndef Q_OS_DARWIN
+    want.samples = SDL_max(480, opusConfig->samplesPerFrame * 3);
+#else
+    // HACK: Changing the buffer size can lead to Bluetooth HFP
+    // audio issues on macOS, so we're leaving this alone.
+    // https://github.com/moonlight-stream/moonlight-qt/issues/1071
+    want.samples = SDL_max(480, opusConfig->samplesPerFrame);
+#endif
 
     m_FrameSize = opusConfig->samplesPerFrame * sizeof(short) * opusConfig->channelCount;
 
@@ -58,6 +66,10 @@ bool SdlAudioRenderer::prepareForPlayback(const OPUS_MULTISTREAM_CONFIGURATION* 
                 "Obtained audio buffer: %u samples (%u bytes)",
                 have.samples,
                 have.size);
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "SDL audio driver: %s",
+                SDL_GetCurrentAudioDriver());
 
     // Start playback
     SDL_PauseAudioDevice(m_AudioDevice, 0);
@@ -88,6 +100,12 @@ void* SdlAudioRenderer::getAudioBuffer(int*)
 
 bool SdlAudioRenderer::submitAudio(int bytesWritten)
 {
+    // Our device may enter a permanent error status upon removal, so we need
+    // to recreate the audio device to pick up the new default audio device.
+    if (SDL_GetAudioDeviceStatus(m_AudioDevice) == SDL_AUDIO_STOPPED) {
+        return false;
+    }
+
     if (bytesWritten == 0) {
         // Nothing to do
         return true;

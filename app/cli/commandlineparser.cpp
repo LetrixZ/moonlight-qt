@@ -164,8 +164,10 @@ GlobalCommandLineParser::ParseResult GlobalCommandLineParser::parse(const QStrin
         "Starts Moonlight normally if no arguments are given.\n"
         "\n"
         "Available actions:\n"
+        "  list            List the available apps on a host\n"
         "  quit            Quit the currently running app\n"
         "  stream          Start streaming an app\n"
+        "  pair            Pair a new host\n"
         "\n"
         "See 'moonlight <action> --help' for help of specific action."
     );
@@ -193,6 +195,10 @@ GlobalCommandLineParser::ParseResult GlobalCommandLineParser::parse(const QStrin
                 return QuitRequested;
             } else if (action == "stream") {
                 return StreamRequested;
+            } else if (action == "pair") {
+                return PairRequested;
+            } else if (action == "list") {
+                return ListRequested;
             }
         }
 
@@ -240,6 +246,58 @@ void QuitCommandLineParser::parse(const QStringList &args)
 QString QuitCommandLineParser::getHost() const
 {
     return m_Host;
+}
+
+PairCommandLineParser::PairCommandLineParser()
+{
+}
+
+PairCommandLineParser::~PairCommandLineParser()
+{
+}
+
+void PairCommandLineParser::parse(const QStringList &args)
+{
+    CommandLineParser parser;
+    parser.setupCommonOptions();
+    parser.setApplicationDescription(
+        "\n"
+        "Pair with the specified host."
+    );
+    parser.addPositionalArgument("pair", "pair host");
+    parser.addPositionalArgument("host", "Host computer name, UUID, or IP address", "<host>");
+    parser.addValueOption("pin", "4 digit pairing PIN");
+
+    if (!parser.parse(args)) {
+        parser.showError(parser.errorText());
+    }
+
+    parser.handleUnknownOptions();
+
+    // This method will not return and terminates the process if --version or
+    // --help is specified
+    parser.handleHelpAndVersionOptions();
+
+    // Verify that host has been provided
+    auto posArgs = parser.positionalArguments();
+    if (posArgs.length() < 2) {
+        parser.showError("Host not provided");
+    }
+    m_Host = parser.positionalArguments().at(1);
+    m_PredefinedPin = parser.value("pin");
+    if (!m_PredefinedPin.isEmpty() && m_PredefinedPin.length() != 4) {
+        parser.showError("PIN must be 4 digits");
+    }
+}
+
+QString PairCommandLineParser::getHost() const
+{
+    return m_Host;
+}
+
+QString PairCommandLineParser::getPredefinedPin() const
+{
+    return m_PredefinedPin;
 }
 
 StreamCommandLineParser::StreamCommandLineParser()
@@ -312,6 +370,7 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     parser.addToggleOption("background-gamepad", "background gamepad input");
     parser.addToggleOption("reverse-scroll-direction", "inverted scroll direction");
     parser.addToggleOption("swap-gamepad-buttons", "swap A/B and X/Y gamepad buttons (Nintendo-style)");
+    parser.addToggleOption("keep-awake", "prevent display sleep while streaming");
     parser.addChoiceOption("capture-system-keys", "capture system key combos", m_CaptureSysKeysModeMap.keys());
     parser.addChoiceOption("video-codec", "video codec", m_VideoCodecMap.keys());
     parser.addChoiceOption("video-decoder", "video decoder", m_VideoDecoderMap.keys());
@@ -423,6 +482,9 @@ void StreamCommandLineParser::parse(const QStringList &args, StreamingPreference
     // Resolve --swap-gamepad-buttons and --no-swap-gamepad-buttons options
     preferences->swapFaceButtons = parser.getToggleOptionValue("swap-gamepad-buttons", preferences->swapFaceButtons);
 
+    // Resolve --keep-awake and --no-keep-awake options
+    preferences->keepAwake = parser.getToggleOptionValue("keep-awake", preferences->keepAwake);
+
     // Resolve --capture-system-keys option
     if (parser.isSet("capture-system-keys")) {
         preferences->captureSysKeysMode = mapValue(m_CaptureSysKeysModeMap, parser.getChoiceOptionValue("capture-system-keys"));
@@ -463,4 +525,63 @@ QString StreamCommandLineParser::getHost() const
 QString StreamCommandLineParser::getAppName() const
 {
     return m_AppName;
+}
+
+ListCommandLineParser::ListCommandLineParser()
+{
+}
+
+ListCommandLineParser::~ListCommandLineParser()
+{
+}
+
+void ListCommandLineParser::parse(const QStringList &args)
+{
+    CommandLineParser parser;
+    parser.setupCommonOptions();
+    parser.setApplicationDescription(
+        "\n"
+        "List the available apps on the given host."
+    );
+    parser.addPositionalArgument("list", "list available apps");
+    parser.addPositionalArgument("host", "Host computer name, UUID, or IP address", "<host>");
+
+    parser.addFlagOption("csv",     "Print as CSV with additional information");
+    parser.addFlagOption("verbose", "Displays additional information");
+
+    if (!parser.parse(args)) {
+        parser.showError(parser.errorText());
+    }
+
+    parser.handleUnknownOptions();
+
+
+    m_PrintCSV = parser.isSet("csv");
+    m_Verbose = parser.isSet("verbose");
+
+    // This method will not return and terminates the process if --version or
+    // --help is specified
+    parser.handleHelpAndVersionOptions();
+
+    // Verify that host has been provided
+    auto posArgs = parser.positionalArguments();
+    if (posArgs.length() < 2) {
+        parser.showError("Host not provided");
+    }
+    m_Host = parser.positionalArguments().at(1);
+}
+
+QString ListCommandLineParser::getHost() const
+{
+    return m_Host;
+}
+
+bool ListCommandLineParser::isPrintCSV() const
+{
+    return m_PrintCSV;
+}
+
+bool ListCommandLineParser::isVerbose() const
+{
+    return m_Verbose;
 }

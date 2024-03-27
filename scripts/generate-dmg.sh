@@ -1,6 +1,5 @@
 # This script requires create-dmg to be installed from https://github.com/sindresorhus/create-dmg
 BUILD_CONFIG=$1
-ARCH=$2
 
 fail()
 {
@@ -17,10 +16,6 @@ SOURCE_ROOT=$PWD
 BUILD_FOLDER=$BUILD_ROOT/build-$BUILD_CONFIG
 INSTALLER_FOLDER=$BUILD_ROOT/installer-$BUILD_CONFIG
 VERSION=`cat $SOURCE_ROOT/app/version.txt`
-
-if [ "$ARCH" != "" ]; then
-  BUILD_FOLDER=$BUILD_FOLDER-$ARCH
-fi
 
 if [ "$SIGNING_PROVIDER_SHORTNAME" == "" ]; then
   SIGNING_PROVIDER_SHORTNAME=$SIGNING_IDENTITY
@@ -40,23 +35,13 @@ mkdir $INSTALLER_FOLDER
 
 echo Configuring the project
 pushd $BUILD_FOLDER
-qmake $SOURCE_ROOT/moonlight-qt.pro || fail "Qmake failed!"
+qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" || fail "Qmake failed!"
 popd
 
 echo Compiling Moonlight in $BUILD_CONFIG configuration
 pushd $BUILD_FOLDER
 make -j$(sysctl -n hw.logicalcpu) $(echo "$BUILD_CONFIG" | tr '[:upper:]' '[:lower:]') || fail "Make failed!"
 popd
-
-if [ "$ARCH" != "" ]; then
-  echo Single arch binary build successful
-  exit 0
-fi
-
-if [ "$MOONLIGHT_ALT_ARCH" != "" ]; then
-  echo Creating Universal binary with alternate arch
-  lipo $BUILD_FOLDER/app/Moonlight.app/Contents/MacOS/Moonlight $BUILD_FOLDER-$MOONLIGHT_ALT_ARCH/app/Moonlight.app/Contents/MacOS/Moonlight -create -o $BUILD_FOLDER/app/Moonlight.app/Contents/MacOS/Moonlight
-fi
 
 echo Saving dSYM file
 pushd $BUILD_FOLDER
@@ -69,6 +54,9 @@ EXTRA_ARGS=
 if [ "$BUILD_CONFIG" == "Debug" ]; then EXTRA_ARGS="$EXTRA_ARGS -use-debug-libs"; fi
 echo Extra deployment arguments: $EXTRA_ARGS
 macdeployqt $BUILD_FOLDER/app/Moonlight.app $EXTRA_ARGS -qmldir=$SOURCE_ROOT/app/gui -appstore-compliant || fail "macdeployqt failed!"
+
+echo Removing dSYM files from app bundle
+find $BUILD_FOLDER/app/Moonlight.app/ -name '*.dSYM' | xargs rm -rf
 
 if [ "$SIGNING_IDENTITY" != "" ]; then
   echo Signing app bundle
@@ -87,15 +75,9 @@ else
   esac
 fi
 
-if [ "$NOTARY_USERNAME" != "" ] && [ "$NOTARY_PASSWORD" != "" ]; then
+if [ "$NOTARY_KEYCHAIN_PROFILE" != "" ]; then
   echo Uploading to App Notary service
-  xcrun altool -t osx -f $INSTALLER_FOLDER/Moonlight\ $VERSION.dmg --primary-bundle-id com.moonlight-stream.Moonlight --notarize-app --username "$NOTARY_USERNAME" --password "$NOTARY_PASSWORD" --asc-provider "$SIGNING_PROVIDER_SHORTNAME" || fail "Notary submission failed"
-  
-  echo Waiting 5 minutes for notarization to complete
-  sleep 300
-
-  echo Getting notarization status
-  xcrun altool -t osx --notarization-history 0 --username "$NOTARY_USERNAME" --password "$NOTARY_PASSWORD" --asc-provider "$SIGNING_PROVIDER_SHORTNAME" || fail "Unable to fetch notarization history!"
+  xcrun notarytool submit --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" --wait $INSTALLER_FOLDER/Moonlight\ $VERSION.dmg || fail "Notary submission failed"
 
   echo Stapling notary ticket to DMG
   xcrun stapler staple -v $INSTALLER_FOLDER/Moonlight\ $VERSION.dmg || fail "Notary ticket stapling failed!"

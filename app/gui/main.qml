@@ -2,6 +2,7 @@ import QtQuick 2.9
 import QtQuick.Controls 2.2
 import QtQuick.Layouts 1.3
 import QtQuick.Window 2.2
+import QtQuick.Controls.Material 2.2
 
 import ComputerManager 1.0
 import AutoUpdateChecker 1.0
@@ -23,6 +24,15 @@ ApplicationWindow {
     visible: true
     width: 1280
     height: 600
+
+    // Override the background color to Material 2 colors for Qt 6.5+
+    // in order to improve contrast between GFE's placeholder box art
+    // and the background of the app grid.
+    Component.onCompleted: {
+        if (SystemProperties.usesMaterial3Theme) {
+            Material.background = "#303030"
+        }
+    }
 
     visibility: {
         if (SystemProperties.hasDesktopEnvironment) {
@@ -190,10 +200,20 @@ ApplicationWindow {
         }
     }
 
-    function navigateTo(url, objectName)
+    // Workaround for lack of instanceof in Qt 5.9.
+    //
+    // Based on https://stackoverflow.com/questions/13923794/how-to-do-a-is-a-typeof-or-instanceof-in-qml
+    function qmltypeof(obj, className) { // QtObject, string -> bool
+        // className plus "(" is the class instance without modification
+        // className plus "_QML" is the class instance with user-defined properties
+        var str = obj.toString();
+        return str.startsWith(className + "(") || str.startsWith(className + "_QML");
+    }
+
+    function navigateTo(url, objectType)
     {
         var existingItem = stackView.find(function(item, index) {
-            return item.objectName === objectName
+            return qmltypeof(item, objectType)
         })
 
         if (existingItem !== null) {
@@ -224,7 +244,7 @@ ApplicationWindow {
         }
 
         RowLayout {
-            spacing: 20
+            spacing: 10
             anchors.leftMargin: 10
             anchors.rightMargin: 10
             anchors.fill: parent
@@ -260,7 +280,7 @@ ApplicationWindow {
 
             Label {
                 id: versionLabel
-                visible: stackView.currentItem.objectName === qsTr("Settings")
+                visible: qmltypeof(stackView.currentItem, "SettingsView")
                 text: qsTr("Version %1").arg(SystemProperties.versionString)
                 font.pointSize: 12
                 horizontalAlignment: Qt.AlignRight
@@ -279,9 +299,9 @@ ApplicationWindow {
             NavigableToolButton {
                 id: discordButton
                 visible: SystemProperties.hasBrowser &&
-                         stackView.currentItem.objectName === qsTr("Settings")
+                         qmltypeof(stackView.currentItem, "SettingsView")
 
-                iconSource: "qrc:/res/Discord-Logo-White.svg"
+                iconSource: "qrc:/res/discord.svg"
 
                 ToolTip.delay: 1000
                 ToolTip.timeout: 3000
@@ -298,7 +318,7 @@ ApplicationWindow {
 
             NavigableToolButton {
                 id: addPcButton
-                visible: stackView.currentItem.objectName === qsTr("Computers")
+                visible: qmltypeof(stackView.currentItem, "PcView")
 
                 iconSource:  "qrc:/res/ic_add_to_queue_white_48px.svg"
 
@@ -396,7 +416,7 @@ ApplicationWindow {
 
                 iconSource: "qrc:/res/ic_videogame_asset_white_48px.svg"
 
-                onClicked: navigateTo("qrc:/gui/GamepadMapper.qml", qsTr("Gamepad Mapping"))
+                onClicked: navigateTo("qrc:/gui/GamepadMapper.qml", "GamepadMapper")
 
                 Keys.onDownPressed: {
                     stackView.currentItem.forceActiveFocus(Qt.TabFocus)
@@ -408,7 +428,8 @@ ApplicationWindow {
 
                 iconSource:  "qrc:/res/settings.svg"
 
-                onClicked: navigateTo(settingsViewPath, qsTr("Settings"))
+                // onClicked: navigateTo("qrc:/gui/SettingsView.qml", qsTr("Settings"))
+                onClicked: navigateTo("qrc:/gui/SettingsView.qml", qsTr("Settings"))
 
                 Keys.onDownPressed: {
                     stackView.currentItem.forceActiveFocus(Qt.TabFocus)
@@ -430,7 +451,7 @@ ApplicationWindow {
 
     ErrorMessageDialog {
         id: noHwDecoderDialog
-        text: qsTr("No functioning hardware accelerated H.264 video decoder was detected by Moonlight. " +
+        text: qsTr("No functioning hardware accelerated video decoder was detected by Moonlight. " +
                    "Your streaming performance may be severely degraded in this configuration.")
         helpText: qsTr("Click the Help button for more information on solving this problem.")
         helpUrl: "https://github.com/moonlight-stream/moonlight-docs/wiki/Fixing-Hardware-Decoding-Problems"
@@ -496,7 +517,7 @@ ApplicationWindow {
 
     NavigableDialog {
         id: addPcDialog
-        property string label: qsTr("Enter the IP address of your GameStream PC:")
+        property string label: qsTr("Enter the IP address of your host PC:")
 
         standardButtons: Dialog.Ok | Dialog.Cancel
 
@@ -511,7 +532,7 @@ ApplicationWindow {
 
         onAccepted: {
             if (editText.text) {
-                ComputerManager.addNewHost(editText.text.trim(), false)
+                ComputerManager.addNewHostManually(editText.text.trim())
             }
         }
 

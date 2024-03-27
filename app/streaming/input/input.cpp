@@ -9,18 +9,16 @@
 #include <QDir>
 #include <QGuiApplication>
 
-#define MOUSE_POLLING_INTERVAL 5
-
-SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, NvComputer*, int streamWidth, int streamHeight)
+SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, int streamHeight)
     : m_MultiController(prefs.multiController),
       m_GamepadMouse(prefs.gamepadMouse),
       m_SwapMouseButtons(prefs.swapMouseButtons),
       m_ReverseScrollDirection(prefs.reverseScrollDirection),
       m_SwapFaceButtons(prefs.swapFaceButtons),
-      m_MouseMoveTimer(0),
-      m_MousePositionLock(0),
       m_MouseWasInVideoRegion(false),
       m_PendingMouseButtonsAllUpOnVideoRegionLeave(false),
+      m_PointerRegionLockActive(false),
+      m_PointerRegionLockToggledByUser(false),
       m_FakeCaptureActive(false),
       m_CaptureSystemKeysMode(prefs.captureSysKeysMode),
       m_MouseCursorCapturedVisibilityState(SDL_DISABLE),
@@ -29,12 +27,12 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, NvComputer*, int s
       m_StreamHeight(streamHeight),
       m_AbsoluteMouseMode(prefs.absoluteMouseMode),
       m_AbsoluteTouchMode(prefs.absoluteTouchMode),
+      m_DisabledTouchFeedback(false),
       m_LeftButtonReleaseTimer(0),
       m_RightButtonReleaseTimer(0),
       m_DragTimer(0),
       m_DragButton(0),
-      m_NumFingersDown(0),
-      m_ClipboardData()
+      m_NumFingersDown(0)
 {
     // System keys are always captured when running without a DE
     if (!WMUtils::isRunningDesktopEnvironment()) {
@@ -116,6 +114,11 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, NvComputer*, int s
     m_SpecialKeyCombos[KeyComboPasteText].scanCode = SDL_SCANCODE_V;
     m_SpecialKeyCombos[KeyComboPasteText].enabled = true;
 
+    m_SpecialKeyCombos[KeyComboTogglePointerRegionLock].keyCombo = KeyComboTogglePointerRegionLock;
+    m_SpecialKeyCombos[KeyComboTogglePointerRegionLock].keyCode = SDLK_l;
+    m_SpecialKeyCombos[KeyComboTogglePointerRegionLock].scanCode = SDL_SCANCODE_L;
+    m_SpecialKeyCombos[KeyComboTogglePointerRegionLock].enabled = true;
+
     m_OldIgnoreDevices = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES);
     m_OldIgnoreDevicesExcept = SDL_GetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT);
 
@@ -126,6 +129,20 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, NvComputer*, int s
         streamIgnoreDevices += ',';
     }
     streamIgnoreDevices += m_OldIgnoreDevices;
+
+    // STREAM_IGNORE_DEVICE_GUIDS allows to specify additional devices to be ignored when starting
+    // the stream in case the scope of STREAM_GAMECONTROLLER_IGNORE_DEVICES is too broad. One such
+    // case is "Steam Virtual Gamepad" where everything is under the same VID/PID, but different GUIDs.
+    // Multiple GUIDs can be provided, but need to be separated by commas:
+    //
+    //     <GUID>,<GUID>,<GUID>,...
+    //
+    QString streamIgnoreDeviceGuids = qgetenv("STREAM_IGNORE_DEVICE_GUIDS");
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+    m_IgnoreDeviceGuids = streamIgnoreDeviceGuids.split(',', Qt::SkipEmptyParts);
+#else
+    m_IgnoreDeviceGuids = streamIgnoreDeviceGuids.split(',', QString::SkipEmptyParts);
+#endif
 
     // For SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES, we use the union of SDL_GAMECONTROLLER_IGNORE_DEVICES
     // and STREAM_GAMECONTROLLER_IGNORE_DEVICES while streaming. STREAM_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT
@@ -172,10 +189,6 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, NvComputer*, int s
     }
 #endif
 
-#ifdef Q_OS_DARWIN
-    CGSGetGlobalHotKeyOperatingMode(_CGSDefaultConnection(), &m_OldHotKeyMode);
-#endif
-
     // Initialize the gamepad mask with currently attached gamepads to avoid
     // causing gamepads to unexpectedly disappear and reappear on the host
     // during stream startup as we detect currently attached gamepads one at a time.
@@ -185,30 +198,6 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, NvComputer*, int s
     SDL_zero(m_LastTouchDownEvent);
     SDL_zero(m_LastTouchUpEvent);
     SDL_zero(m_TouchDownEvent);
-    SDL_zero(m_MousePositionReport);
-
-    SDL_AtomicSet(&m_MouseDeltaX, 0);
-    SDL_AtomicSet(&m_MouseDeltaY, 0);
-    SDL_AtomicSet(&m_MousePositionUpdated, 0);
-
-    Uint32 pollingInterval = QString(qgetenv("MOUSE_POLLING_INTERVAL")).toUInt();
-    if (pollingInterval == 0) {
-        pollingInterval = MOUSE_POLLING_INTERVAL;
-    }
-    else {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Using custom mouse polling interval: %u ms",
-                    pollingInterval);
-    }
-
-    m_MouseMoveTimer = SDL_AddTimer(pollingInterval, SdlInputHandler::mouseMoveTimerCallback, this);
-
-    // Initialize state used by the clipboard thread before we start it
-    SDL_AtomicSet(&m_ShutdownClipboardThread, 0);
-    m_ClipboardHasData = SDL_CreateCond();
-    m_ClipboardLock = SDL_CreateMutex();
-
-    m_ClipboardThread = SDL_CreateThread(SdlInputHandler::clipboardThreadProc, "Clipboard Sender", this);
 }
 
 SdlInputHandler::~SdlInputHandler()
@@ -228,26 +217,10 @@ SdlInputHandler::~SdlInputHandler()
         }
     }
 
-    SDL_RemoveTimer(m_MouseMoveTimer);
     SDL_RemoveTimer(m_LongPressTimer);
     SDL_RemoveTimer(m_LeftButtonReleaseTimer);
     SDL_RemoveTimer(m_RightButtonReleaseTimer);
     SDL_RemoveTimer(m_DragTimer);
-
-    // Wake up the clipboard thread to terminate it
-    SDL_AtomicSet(&m_ShutdownClipboardThread, 1);
-    SDL_CondBroadcast(m_ClipboardHasData);
-
-    // Wait for it to terminate
-    SDL_WaitThread(m_ClipboardThread, nullptr);
-
-    // Now we can safely clean up its resources
-    SDL_DestroyCond(m_ClipboardHasData);
-    SDL_DestroyMutex(m_ClipboardLock);
-
-#ifdef Q_OS_DARWIN
-    CGSSetGlobalHotKeyOperatingMode(_CGSDefaultConnection(), m_OldHotKeyMode);
-#endif
 
 #if !SDL_VERSION_ATLEAST(2, 0, 9)
     SDL_QuitSubSystem(SDL_INIT_HAPTIC);
@@ -328,25 +301,9 @@ void SdlInputHandler::notifyFocusLost()
         setCaptureActive(false);
     }
 
-#ifdef Q_OS_DARWIN
-    // Ungrab the keyboard
-    updateKeyboardGrabState();
-#endif
-
     // Raise all keys that are currently pressed. If we don't do this, certain keys
     // used in shortcuts that cause focus loss (such as Alt+Tab) may get stuck down.
     raiseAllKeys();
-}
-
-void SdlInputHandler::notifyFocusGained()
-{
-#ifdef Q_OS_DARWIN
-    // Re-grab the keyboard if it was grabbed before focus loss
-    // FIXME: We only do this on macOS because we get a spurious
-    // focus gain when in SDL_WINDOW_FULLSCREEN_DESKTOP on Windows
-    // immediately after losing focus by clicking on another window.
-    updateKeyboardGrabState();
-#endif
 }
 
 bool SdlInputHandler::isCaptureActive()
@@ -372,51 +329,15 @@ void SdlInputHandler::updateKeyboardGrabState()
         // Ungrab if it's fullscreen only and we left fullscreen
         shouldGrab = false;
     }
-#ifdef Q_OS_DARWIN
-    else if (!(windowFlags & SDL_WINDOW_INPUT_FOCUS)) {
-        // Ungrab if we lose input focus on macOS. SDL will handle
-        // this internally for platforms where we use the SDL
-        // SDL_SetWindowKeyboardGrab() API exclusively.
-        //
-        // NB: On X11, we may not have input focus at the time of
-        // the initial keyboard grab update, so we must not enable
-        // this codepath on Linux.
-        shouldGrab = false;
-    }
-#endif
 
     // Don't close the window on Alt+F4 when keyboard grab is enabled
     SDL_SetHint(SDL_HINT_WINDOWS_NO_CLOSE_ON_ALT_F4, shouldGrab ? "1" : "0");
 
-    if (shouldGrab) {
 #if SDL_VERSION_ATLEAST(2, 0, 15)
-        // On SDL 2.0.15, we can get keyboard-only grab on Win32, X11, and Wayland.
-        // This does nothing on macOS but it sets the SDL_WINDOW_KEYBOARD_GRABBED flag
-        // that we look for to see if keyboard capture is enabled. We'll handle macOS
-        // ourselves below using the private CGSSetGlobalHotKeyOperatingMode() API.
-        SDL_SetWindowKeyboardGrab(m_Window, SDL_TRUE);
-#else
-        // If we're in full-screen desktop mode and SDL doesn't have keyboard grab yet,
-        // grab the cursor (will grab the keyboard too on X11).
-        if (SDL_GetWindowFlags(m_Window) & SDL_WINDOW_FULLSCREEN) {
-            SDL_SetWindowGrab(m_Window, SDL_TRUE);
-        }
+    // On SDL 2.0.15+, we can get keyboard-only grab on Win32, X11, and Wayland.
+    // SDL 2.0.18 adds keyboard grab on macOS (if built with non-AppStore APIs).
+    SDL_SetWindowKeyboardGrab(m_Window, shouldGrab ? SDL_TRUE : SDL_FALSE);
 #endif
-#ifdef Q_OS_DARWIN
-        // SDL doesn't support this private macOS API
-        CGSSetGlobalHotKeyOperatingMode(_CGSDefaultConnection(), CGSGlobalHotKeyDisable);
-#endif
-    }
-    else {
-#if SDL_VERSION_ATLEAST(2, 0, 15)
-        // Allow the keyboard to leave the window
-        SDL_SetWindowKeyboardGrab(m_Window, SDL_FALSE);
-#endif
-#ifdef Q_OS_DARWIN
-        // SDL doesn't support this private macOS API
-        CGSSetGlobalHotKeyOperatingMode(_CGSDefaultConnection(), m_OldHotKeyMode);
-#endif
-    }
 }
 
 bool SdlInputHandler::isSystemKeyCaptureActive()
@@ -452,23 +373,6 @@ bool SdlInputHandler::isSystemKeyCaptureActive()
 void SdlInputHandler::setCaptureActive(bool active)
 {
     if (active) {
-        // If we're in full-screen exclusive mode, grab the cursor so it can't accidentally leave our window.
-        if ((SDL_GetWindowFlags(m_Window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN) {
-#if SDL_VERSION_ATLEAST(2, 0, 15)
-            SDL_SetWindowMouseGrab(m_Window, SDL_TRUE);
-#else
-            SDL_SetWindowGrab(m_Window, SDL_TRUE);
-#endif
-        }
-
-        if (!m_AbsoluteMouseMode) {
-            // If our window is occluded when mouse is captured, the mouse may
-            // get stuck on top of the occluding window and not be properly
-            // captured. We can avoid this by raising our window before we
-            // capture the mouse.
-            SDL_RaiseWindow(m_Window);
-        }
-
         // If we're in relative mode, try to activate SDL's relative mouse mode
         if (m_AbsoluteMouseMode || SDL_SetRelativeMouseMode(SDL_TRUE) < 0) {
             // Relative mouse mode didn't work or was disabled, so we'll just hide the cursor
@@ -491,7 +395,14 @@ void SdlInputHandler::setCaptureActive(bool active)
             mouseY -= windowY;
 
             if (isMouseInVideoRegion(mouseX, mouseY)) {
-                updateMousePositionReport(mouseX, mouseY);
+                // Synthesize a mouse event to synchronize the cursor
+                SDL_MouseMotionEvent motionEvent = {};
+                motionEvent.type = SDL_MOUSEMOTION;
+                motionEvent.timestamp = SDL_GetTicks();
+                motionEvent.windowID = SDL_GetWindowID(m_Window);
+                motionEvent.x = mouseX;
+                motionEvent.y = mouseY;
+                handleMouseMotionEvent(&motionEvent);
             }
         }
     }
@@ -504,15 +415,10 @@ void SdlInputHandler::setCaptureActive(bool active)
         else {
             SDL_SetRelativeMouseMode(SDL_FALSE);
         }
-
-#if SDL_VERSION_ATLEAST(2, 0, 15)
-        // Allow the cursor to leave the bounds of our window again.
-        SDL_SetWindowMouseGrab(m_Window, SDL_FALSE);
-#else
-        // Allow the cursor to leave the bounds of our window again.
-        SDL_SetWindowGrab(m_Window, SDL_FALSE);
-#endif
     }
+
+    // Update mouse pointer region constraints
+    updatePointerRegionLock();
 
     // Now update the keyboard grab
     updateKeyboardGrabState();

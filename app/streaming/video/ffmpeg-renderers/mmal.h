@@ -17,9 +17,12 @@ public:
     virtual enum AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
     virtual bool needsTestFrame() override;
     virtual int getRendererAttributes() override;
+    virtual int getDecoderColorspace() override;
 
 private:
     static void InputPortCallback(MMAL_PORT_T* port, MMAL_BUFFER_HEADER_T* buffer);
+    bool getDtDeviceStatus(QString name, bool ifUnknown);
+    bool isMmalOverlaySupported();
 
     void setupBackground(PDECODER_PARAMETERS params);
     void updateDisplayRegion();

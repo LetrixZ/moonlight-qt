@@ -2,12 +2,15 @@
 
 #include "identitymanager.h"
 #include "nvapp.h"
+#include "nvaddress.h"
 
 #include <Limelight.h>
 
 #include <QUrl>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+
+class NvComputer;
 
 class NvDisplayMode
 {
@@ -106,7 +109,9 @@ public:
         NVLL_VERBOSE
     };
 
-    explicit NvHTTP(QString address, QSslCertificate serverCert);
+    explicit NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert);
+
+    explicit NvHTTP(NvComputer* computer);
 
     static
     int
@@ -138,9 +143,16 @@ public:
 
     void setServerCert(QSslCertificate serverCert);
 
-    void setAddress(QString address);
+    void setAddress(NvAddress address);
+    void setHttpsPort(uint16_t port);
 
-    QString address();
+    NvAddress address();
+
+    QSslCertificate serverCert();
+
+    uint16_t httpPort();
+
+    uint16_t httpsPort();
 
     static
     QVector<int>
@@ -150,14 +162,15 @@ public:
     quitApp();
 
     void
-    resumeApp(PSTREAM_CONFIGURATION streamConfig);
-
-    void
-    launchApp(int appId,
-              PSTREAM_CONFIGURATION streamConfig,
-              bool sops,
-              bool localAudio,
-              int gamepadMask);
+    startApp(QString verb,
+             bool isGfe,
+             int appId,
+             PSTREAM_CONFIGURATION streamConfig,
+             bool sops,
+             bool localAudio,
+             int gamepadMask,
+             bool persistGameControllersOnDisconnect,
+             QString& rtspSessionUrl);
 
     QVector<NvApp>
     getAppList();
@@ -182,7 +195,7 @@ private:
                    int timeoutMs,
                    NvLogLevel logLevel);
 
-    QString m_Address;
+    NvAddress m_Address;
     QNetworkAccessManager m_Nam;
     QSslCertificate m_ServerCert;
 };

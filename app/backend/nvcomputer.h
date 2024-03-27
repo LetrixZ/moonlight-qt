@@ -1,11 +1,22 @@
 #pragma once
 
 #include "nvhttp.h"
+#include "nvaddress.h"
 
 #include <QThread>
 #include <QReadWriteLock>
 #include <QSettings>
 #include <QRunnable>
+
+class CopySafeReadWriteLock : public QReadWriteLock
+{
+public:
+    CopySafeReadWriteLock() = default;
+
+    // Don't actually copy the QReadWriteLock
+    CopySafeReadWriteLock(const CopySafeReadWriteLock&) : QReadWriteLock() {}
+    CopySafeReadWriteLock& operator=(const CopySafeReadWriteLock &) { return *this; }
+};
 
 class NvComputer
 {
@@ -21,24 +32,46 @@ private:
     bool pendingQuit;
 
 public:
-    explicit NvComputer(QString address, QString serverInfo, QSslCertificate serverCert);
+    NvComputer() = default;
+
+    // Caller is responsible for synchronizing read access to the other host
+    NvComputer(const NvComputer&) = default;
+
+    // Caller is responsible for synchronizing read access to the other host
+    NvComputer& operator=(const NvComputer &) = default;
+
+    explicit NvComputer(NvHTTP& http, QString serverInfo);
 
     explicit NvComputer(QSettings& settings);
 
-    bool
-    update(NvComputer& that);
+    void
+    setRemoteAddress(QHostAddress);
 
     bool
-    wake();
+    update(const NvComputer& that);
 
     bool
-    isReachableOverVpn();
+    wake() const;
 
-    QVector<QString>
+    enum ReachabilityType
+    {
+        RI_UNKNOWN,
+        RI_LAN,
+        RI_VPN,
+    };
+
+    ReachabilityType
+    getActiveAddressReachability() const;
+
+    QVector<NvAddress>
     uniqueAddresses() const;
 
     void
-    serialize(QSettings& settings) const;
+    serialize(QSettings& settings, bool serializeApps) const;
+
+    // Caller is responsible for synchronizing read access to both hosts
+    bool
+    isEqualSerialized(const NvComputer& that) const;
 
     enum PairState
     {
@@ -57,7 +90,8 @@ public:
     // Ephemeral traits
     ComputerState state;
     PairState pairState;
-    QString activeAddress;
+    NvAddress activeAddress;
+    uint16_t activeHttpsPort;
     int currentGameId;
     QString gfeVersion;
     QString appVersion;
@@ -68,17 +102,22 @@ public:
     bool isSupportedServerVersion;
 
     // Persisted traits
-    QString localAddress;
-    QString remoteAddress;
-    QString ipv6Address;
-    QString manualAddress;
+    NvAddress localAddress;
+    NvAddress remoteAddress;
+    NvAddress ipv6Address;
+    NvAddress manualAddress;
     QByteArray macAddress;
     QString name;
     bool hasCustomName;
     QString uuid;
     QSslCertificate serverCert;
     QVector<NvApp> appList;
+    bool isNvidiaServerSoftware;
+    // Remember to update isEqualSerialized() when adding fields here!
 
     // Synchronization
-    mutable QReadWriteLock lock;
+    mutable CopySafeReadWriteLock lock;
+
+private:
+    uint16_t externalPort;
 };

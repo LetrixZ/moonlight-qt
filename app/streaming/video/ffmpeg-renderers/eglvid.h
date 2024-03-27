@@ -2,8 +2,9 @@
 
 #include "renderer.h"
 
+#define SDL_USE_BUILTIN_OPENGL_DEFINITIONS 1
+#include <SDL_egl.h>
 #include <SDL_opengles2.h>
-#include <SDL_opengles2_gl2ext.h>
 
 class EGLRenderer : public IFFmpegRenderer {
 public:
@@ -11,25 +12,25 @@ public:
     virtual ~EGLRenderer() override;
     virtual bool initialize(PDECODER_PARAMETERS params) override;
     virtual bool prepareDecoderContext(AVCodecContext* context, AVDictionary** options) override;
+    virtual void cleanupRenderContext() override;
+    virtual void waitToRender() override;
     virtual void renderFrame(AVFrame* frame) override;
     virtual bool testRenderFrame(AVFrame* frame) override;
     virtual void notifyOverlayUpdated(Overlay::OverlayType) override;
+    virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO) override;
     virtual bool isPixelFormatSupported(int videoFormat, enum AVPixelFormat pixelFormat) override;
     virtual AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
 
 private:
 
-    void renderOverlay(Overlay::OverlayType type);
+    void renderOverlay(Overlay::OverlayType type, int viewportWidth, int viewportHeight);
     unsigned compileShader(const char* vertexShaderSrc, const char* fragmentShaderSrc);
     bool compileShaders();
     bool specialize();
-    const float *getColorOffsets();
-    const float *getColorMatrix();
+    const float *getColorOffsets(const AVFrame* frame);
+    const float *getColorMatrix(const AVFrame* frame);
     static int loadAndBuildShader(int shaderType, const char *filename);
     bool openDisplay(unsigned int platform, void* nativeDisplay);
-
-    int m_ViewportWidth;
-    int m_ViewportHeight;
 
     AVPixelFormat m_EGLImagePixelFormat;
     void *m_EGLDisplay;
@@ -43,14 +44,20 @@ private:
     SDL_Window *m_Window;
     IFFmpegRenderer *m_Backend;
     unsigned int m_VAO;
-    int m_ColorSpace;
-    bool m_ColorFull;
     bool m_BlockingSwapBuffers;
+    EGLSync m_LastRenderSync;
     AVFrame* m_LastFrame;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC m_glEGLImageTargetTexture2DOES;
     PFNGLGENVERTEXARRAYSOESPROC m_glGenVertexArraysOES;
     PFNGLBINDVERTEXARRAYOESPROC m_glBindVertexArrayOES;
     PFNGLDELETEVERTEXARRAYSOESPROC m_glDeleteVertexArraysOES;
+    PFNEGLCREATESYNCPROC m_eglCreateSync;
+    PFNEGLCREATESYNCKHRPROC m_eglCreateSyncKHR;
+    PFNEGLDESTROYSYNCPROC m_eglDestroySync;
+    PFNEGLCLIENTWAITSYNCPROC m_eglClientWaitSync;
+    int m_GlesMajorVersion;
+    int m_GlesMinorVersion;
+    bool m_HasExtUnpackSubimage;
 
 #define NV12_PARAM_YUVMAT 0
 #define NV12_PARAM_OFFSET 1
@@ -71,4 +78,5 @@ private:
     // HACK: Work around bug where renderer will repeatedly fail with:
     // SDL_CreateRenderer() failed: Could not create GLES window surface
     static SDL_Window* s_LastFailedWindow;
+    static int s_LastFailedVideoFormat;
 };

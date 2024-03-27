@@ -5,7 +5,15 @@
 
 #include <Limelight.h>
 
+// HACK: Avoid including X11 headers which conflict with QDir
+#ifdef SDL_VIDEO_DRIVER_X11
+#undef SDL_VIDEO_DRIVER_X11
+#endif
+
 #include <SDL_syswm.h>
+
+#include <QDir>
+#include <QTextStream>
 
 MmalRenderer::MmalRenderer()
     : m_Renderer(nullptr),
@@ -108,6 +116,10 @@ bool MmalRenderer::initialize(PDECODER_PARAMETERS params)
 {
     MMAL_STATUS_T status;
 
+    if (!isMmalOverlaySupported()) {
+        return false;
+    }
+
     m_Window = params->window;
     m_VideoWidth = params->width;
     m_VideoHeight = params->height;
@@ -132,6 +144,12 @@ bool MmalRenderer::initialize(PDECODER_PARAMETERS params)
     m_InputPort->format->es->video.crop.y = 0;
     m_InputPort->format->es->video.crop.width = params->width;
     m_InputPort->format->es->video.crop.height = params->height;
+
+    // Setting colorspace like this doesn't seem to make a difference,
+    // but we'll do it just in case it starts working in the future.
+    // The default appears to be Rec. 709 already.
+    m_InputPort->format->es->video.color_space = MMAL_COLOR_SPACE_ITUR_BT709;
+
     status = mmal_port_format_commit(m_InputPort);
     if (status != MMAL_SUCCESS) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -192,22 +210,18 @@ bool MmalRenderer::initialize(PDECODER_PARAMETERS params)
     return true;
 }
 
+int MmalRenderer::getDecoderColorspace()
+{
+    // MMAL seems to always use Rec. 709 colorspace for rendering
+    // even when we try to set something else in the input format.
+    return COLORSPACE_REC_709;
+}
+
 void MmalRenderer::setupBackground(PDECODER_PARAMETERS params)
 {
-    SDL_SysWMinfo info;
-
-    SDL_VERSION(&info.version);
-
-    if (!SDL_GetWindowWMInfo(params->window, &info)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "SDL_GetWindowWMInfo() failed: %s",
-                     SDL_GetError());
-        return;
-    }
-
-    // On X11, we can safely create a renderer and draw a black background.
-    // Due to conflicts with Qt, it's unsafe to do this for KMSDRM.
-    if (info.subsystem == SDL_SYSWM_X11) {
+    if (!params->testOnly) {
+        // Create a renderer and draw a black background for the area not covered by the MMAL overlay.
+        // On the KMSDRM backend, this triggers the modeset that puts the CRTC into the mode we selected.
         m_BackgroundRenderer = SDL_CreateRenderer(params->window, -1, SDL_RENDERER_SOFTWARE);
         if (m_BackgroundRenderer == nullptr) {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -225,6 +239,78 @@ void MmalRenderer::setupBackground(PDECODER_PARAMETERS params)
 void MmalRenderer::InputPortCallback(MMAL_PORT_T*, MMAL_BUFFER_HEADER_T* buffer)
 {
     mmal_buffer_header_release(buffer);
+}
+
+// MMAL rendering will silently fail in Full KMS mode. We'll see if that's
+// enabled by reading sysfs. It's gross but it works.
+bool MmalRenderer::getDtDeviceStatus(QString name, bool ifUnknown)
+{
+    QDir dir("/sys/firmware/devicetree/base/soc");
+    QStringList matchingDir = dir.entryList(QStringList(name + "@*"), QDir::Dirs);
+    if (matchingDir.length() != 1) {
+        Q_ASSERT(matchingDir.isEmpty());
+        return ifUnknown;
+    }
+
+    if (!dir.cd(matchingDir.first())) {
+        return ifUnknown;
+    }
+
+    QFile statusFile(dir.filePath("status"));
+    if (!statusFile.open(QFile::ReadOnly)) {
+        // Per Device Tree docs, missing 'status' means enabled
+        return true;
+    }
+
+    QByteArray statusData = statusFile.readAll();
+    QString statusString(statusData);
+
+    // Per Device Tree docs, 'okay' and 'ok' are both acceptable
+    return statusString == "okay" || statusString == "ok";
+}
+
+bool MmalRenderer::isMmalOverlaySupported()
+{
+    if (qgetenv("MMAL_DISABLE_SUPPORT_CHECK") == "1") {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "MMAL overlay support check is disabled");
+        return true;
+    }
+
+    static bool mmalOverlayCheckCompleted = false;
+    static bool mmalOverlayCheckResult = true;
+
+    // This overlay support check is expensive, so only do it once. The stuff we're
+    // checking can't change without restarting Moonlight (or the whole system).
+    if (mmalOverlayCheckCompleted) {
+        SDL_MemoryBarrierAcquire();
+        return mmalOverlayCheckResult;
+    }
+
+    // vc4-fkms-v3d - firmwarekms is 'okay', hvs is 'disabled'
+    // vc4-kms-v3d - firmwarekms is 'disabled', hvs is 'okay' <- this is the bad one
+    // none - firmwarekms is 'disabled', hvs is 'disabled'
+    if (!getDtDeviceStatus("firmwarekms", true) && getDtDeviceStatus("hvs", true)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Full KMS Mode is enabled! Hardware accelerated H.264 decoding will be unavailable!");
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Change 'dtoverlay=vc4-kms-v3d' to 'dtoverlay=vc4-fkms-v3d' in /boot/config.txt to fix this!");
+        mmalOverlayCheckResult = false;
+    }
+
+    // /dev/video19 is the rpivid stateless HEVC decoder
+    if (!QFile::exists("/dev/video19")) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Raspberry Pi HEVC decoder is not enabled! Add 'dtoverlay=rpivid-v4l2' to your /boot/config.txt to fix this!");
+    }
+    else if (strcmp(SDL_GetCurrentVideoDriver(), "KMSDRM") != 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Raspberry Pi HEVC decoder cannot be used from within a desktop environment. H.264 will be used instead.");
+    }
+
+    SDL_MemoryBarrierRelease();
+    mmalOverlayCheckCompleted = true;
+    return mmalOverlayCheckResult;
 }
 
 enum AVPixelFormat MmalRenderer::getPreferredPixelFormat(int)
@@ -248,11 +334,6 @@ bool MmalRenderer::needsTestFrame()
 
 void MmalRenderer::renderFrame(AVFrame* frame)
 {
-    if (frame == nullptr) {
-        // End of stream - nothing to do for us
-        return;
-    }
-
     MMAL_BUFFER_HEADER_T* buffer = (MMAL_BUFFER_HEADER_T*)frame->data[3];
     MMAL_STATUS_T status;
 

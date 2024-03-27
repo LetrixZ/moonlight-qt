@@ -45,6 +45,7 @@ Item {
     {
         // Display the error dialog after Session::exec() returns
         streamSegueErrorDialog.text = text
+        console.error(text)
     }
 
     function displayLaunchWarning(text)
@@ -56,6 +57,7 @@ Item {
         toast.text = text
         toast.timeout = 3000
         toast.visible = true
+        console.warn(text)
     }
 
     function quitStarting()
@@ -103,7 +105,10 @@ Item {
                 streamSegueErrorDialog.open()
             }
         }
+    }
 
+    function sessionReadyForDeletion()
+    {
         // Garbage collect the Session object since it's pretty heavyweight
         // and keeps other libraries (like SDL_TTF) around until it is deleted.
         session = null
@@ -130,6 +135,7 @@ Item {
         session.displayLaunchWarning.connect(displayLaunchWarning)
         session.quitStarting.connect(quitStarting)
         session.sessionFinished.connect(sessionFinished)
+        session.readyForDeletion.connect(sessionReadyForDeletion)
 
         // Kick off the stream
         spinnerTimer.start()
@@ -170,7 +176,7 @@ Item {
             gc()
 
             // Run the streaming session to completion
-            session.exec(Screen.virtualX, Screen.virtualY)
+            session.exec(Window.window)
         }
 
         sourceComponent: Item {}

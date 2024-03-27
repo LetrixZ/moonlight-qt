@@ -24,7 +24,6 @@ public:
 
 private:
     void sendKey(QEvent::Type type, Qt::Key key, Qt::KeyboardModifiers modifiers = Qt::NoModifier);
-    void sendWheel(QPoint& angleDelta);
 
 private slots:
     void onPollingTimerFired();
@@ -34,5 +33,6 @@ private:
     QList<SDL_GameController*> m_Gamepads;
     bool m_Enabled;
     bool m_UiNavMode;
+    bool m_FirstPoll;
     Uint32 m_LastAxisNavigationEventTime;
 };

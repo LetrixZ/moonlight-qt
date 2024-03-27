@@ -15,16 +15,38 @@
 #include <QSettings>
 #include <QRunnable>
 #include <QTimer>
+#include <QMutex>
+#include <QWaitCondition>
+
+class ComputerManager;
+
+class DelayedFlushThread : public QThread
+{
+    Q_OBJECT
+
+public:
+    DelayedFlushThread(ComputerManager* cm)
+        : m_ComputerManager(cm)
+    {
+        setObjectName("CM Delayed Flush Thread");
+    }
+
+    void run();
+
+private:
+    ComputerManager* m_ComputerManager;
+};
 
 class MdnsPendingComputer : public QObject
 {
     Q_OBJECT
 
 public:
-    explicit MdnsPendingComputer(QMdnsEngine::Server* server,
+    explicit MdnsPendingComputer(const QSharedPointer<QMdnsEngine::Server> server,
                                  const QMdnsEngine::Service& service)
         : m_Hostname(service.hostname()),
-          m_Server(server),
+          m_Port(service.port()),
+          m_ServerWeak(server),
           m_Resolver(nullptr)
     {
         // Start resolving
@@ -39,6 +61,11 @@ public:
     QString hostname()
     {
         return m_Hostname;
+    }
+
+    uint16_t port()
+    {
+        return m_Port;
     }
 
 private slots:
@@ -67,15 +94,30 @@ signals:
 private:
     void resolve()
     {
+        // Delete our resolver, so we're guaranteed that nothing is referencing m_Server.
         delete m_Resolver;
-        m_Resolver = new QMdnsEngine::Resolver(m_Server, m_Hostname);
+        m_Resolver = nullptr;
+
+        // Now delete our strong reference that we held on behalf of m_Resolver.
+        // The server may be destroyed after we make this call.
+        m_Server.reset();
+
+        // Re-acquire a strong reference if the server still exists.
+        m_Server = m_ServerWeak.toStrongRef();
+        if (!m_Server) {
+            return;
+        }
+
+        m_Resolver = new QMdnsEngine::Resolver(m_Server.data(), m_Hostname);
         connect(m_Resolver, &QMdnsEngine::Resolver::resolved,
                 this, &MdnsPendingComputer::handleResolvedAddress);
         QTimer::singleShot(2000, this, &MdnsPendingComputer::handleResolvedTimeout);
     }
 
     QByteArray m_Hostname;
-    QMdnsEngine::Server* m_Server;
+    uint16_t m_Port;
+    QWeakPointer<QMdnsEngine::Server> m_ServerWeak;
+    QSharedPointer<QMdnsEngine::Server> m_Server;
     QMdnsEngine::Resolver* m_Resolver;
     QVector<QHostAddress> m_Addresses;
 };
@@ -159,6 +201,8 @@ class ComputerManager : public QObject
 
     friend class DeferredHostDeletionTask;
     friend class PendingAddTask;
+    friend class PendingPairingTask;
+    friend class DelayedFlushThread;
 
 public:
     explicit ComputerManager(QObject *parent = nullptr);
@@ -169,7 +213,11 @@ public:
 
     Q_INVOKABLE void stopPollingAsync();
 
-    Q_INVOKABLE void addNewHost(QString address, bool mdns, QHostAddress mdnsIpv6Address = QHostAddress());
+    Q_INVOKABLE void addNewHostManually(QString address);
+
+    void addNewHost(NvAddress address, bool mdns, NvAddress mdnsIpv6Address = NvAddress());
+
+    QString generatePinString();
 
     void pairHost(NvComputer* computer, QString pin);
 
@@ -203,6 +251,8 @@ private slots:
 private:
     void saveHosts();
 
+    void saveHost(NvComputer* computer);
+
     QHostAddress getBestGlobalAddressV6(QVector<QHostAddress>& addresses);
 
     void startPollingComputer(NvComputer* computer);
@@ -211,9 +261,13 @@ private:
     QReadWriteLock m_Lock;
     QMap<QString, NvComputer*> m_KnownHosts;
     QMap<QString, ComputerPollingEntry*> m_PollEntries;
-    QMdnsEngine::Server m_MdnsServer;
+    QHash<QString, NvComputer> m_LastSerializedHosts; // Protected by m_DelayedFlushMutex
+    QSharedPointer<QMdnsEngine::Server> m_MdnsServer;
     QMdnsEngine::Browser* m_MdnsBrowser;
-    QMdnsEngine::Cache m_MdnsCache;
     QVector<MdnsPendingComputer*> m_PendingResolution;
     CompatFetcher m_CompatFetcher;
+    DelayedFlushThread* m_DelayedFlushThread;
+    QMutex m_DelayedFlushMutex; // Lock ordering: Must never be acquired while holding NvComputer lock
+    QWaitCondition m_DelayedFlushCondition;
+    bool m_NeedsDelayedFlush;
 };

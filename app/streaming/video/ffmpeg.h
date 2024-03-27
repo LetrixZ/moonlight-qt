@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <QQueue>
 
 #include "decoder.h"
 #include "ffmpeg-renderers/renderer.h"
@@ -17,31 +18,44 @@ public:
     virtual bool initialize(PDECODER_PARAMETERS params) override;
     virtual bool isHardwareAccelerated() override;
     virtual bool isAlwaysFullScreen() override;
+    virtual bool isHdrSupported() override;
     virtual int getDecoderCapabilities() override;
     virtual int getDecoderColorspace() override;
+    virtual int getDecoderColorRange() override;
     virtual QSize getDecoderMaxResolution() override;
     virtual int submitDecodeUnit(PDECODE_UNIT du) override;
     virtual void renderFrameOnMainThread() override;
+    virtual void setHdrMode(bool enabled) override;
+    virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info) override;
 
     virtual IFFmpegRenderer* getBackendRenderer();
 
 private:
-    bool completeInitialization(AVCodec* decoder, PDECODER_PARAMETERS params, bool testFrame, bool eglOnly);
+    bool completeInitialization(const AVCodec* decoder,
+                                enum AVPixelFormat requiredFormat,
+                                PDECODER_PARAMETERS params,
+                                bool testFrame,
+                                bool useAlternateFrontend);
 
-    void stringifyVideoStats(VIDEO_STATS& stats, char* output);
+    void stringifyVideoStats(VIDEO_STATS& stats, char* output, int length);
 
     void logVideoStats(VIDEO_STATS& stats, const char* title);
 
     void addVideoStats(VIDEO_STATS& src, VIDEO_STATS& dst);
 
-    bool createFrontendRenderer(PDECODER_PARAMETERS params, bool eglOnly);
+    bool createFrontendRenderer(PDECODER_PARAMETERS params, bool useAlternateFrontend);
 
-    bool tryInitializeRendererForDecoderByName(const char* decoderName,
-                                               PDECODER_PARAMETERS params);
+    bool isDecoderIgnored(const AVCodec* decoder);
 
-    bool tryInitializeRenderer(AVCodec* decoder,
+    bool tryInitializeRendererForUnknownDecoder(const AVCodec* decoder,
+                                                PDECODER_PARAMETERS params,
+                                                bool tryHwAccel);
+
+    bool tryInitializeRenderer(const AVCodec* decoder,
+                               enum AVPixelFormat requiredFormat,
                                PDECODER_PARAMETERS params,
                                const AVCodecHWConfig* hwConfig,
+                               IFFmpegRenderer::InitFailureReason* failureReason,
                                std::function<IFFmpegRenderer*()> createRendererFunc);
 
     static IFFmpegRenderer* createHwAccelRenderer(const AVCodecHWConfig* hwDecodeCfg, int pass);
@@ -54,8 +68,13 @@ private:
     enum AVPixelFormat ffGetFormat(AVCodecContext* context,
                                    const enum AVPixelFormat* pixFmts);
 
+    void decoderThreadProc();
+
+    static int decoderThreadProcThunk(void* context);
+
     AVPacket* m_Pkt;
     AVCodecContext* m_VideoDecoderCtx;
+    enum AVPixelFormat m_RequiredPixelFormat;
     QByteArray m_DecodeBuffer;
     const AVCodecHWConfig* m_HwDecodeCfg;
     IFFmpegRenderer* m_BackendRenderer;
@@ -74,8 +93,15 @@ private:
     int m_VideoFormat;
     bool m_NeedsSpsFixup;
     bool m_TestOnly;
+    SDL_Thread* m_DecoderThread;
+    SDL_atomic_t m_DecoderThreadShouldQuit;
+
+    // Data buffers in the queued DU are not valid
+    QQueue<DECODE_UNIT> m_FrameInfoQueue;
 
     static const uint8_t k_H264TestFrame[];
     static const uint8_t k_HEVCMainTestFrame[];
     static const uint8_t k_HEVCMain10TestFrame[];
+    static const uint8_t k_AV1Main8TestFrame[];
+    static const uint8_t k_AV1Main10TestFrame[];
 };

@@ -1,4 +1,4 @@
-#include "nvhttp.h"
+#include "nvcomputer.h"
 #include <Limelight.h>
 
 #include <QDebug>
@@ -18,15 +18,14 @@
 #define RESUME_TIMEOUT_MS 30000
 #define QUIT_TIMEOUT_MS 30000
 
-NvHTTP::NvHTTP(QString address, QSslCertificate serverCert) :
+NvHTTP::NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert) :
     m_ServerCert(serverCert)
 {
     m_BaseUrlHttp.setScheme("http");
     m_BaseUrlHttps.setScheme("https");
-    m_BaseUrlHttp.setPort(47989);
-    m_BaseUrlHttps.setPort(47984);
 
     setAddress(address);
+    setHttpsPort(httpsPort);
 
     // Never use a proxy server
     QNetworkProxy noProxy(QNetworkProxy::NoProxy);
@@ -35,24 +34,52 @@ NvHTTP::NvHTTP(QString address, QSslCertificate serverCert) :
     connect(&m_Nam, &QNetworkAccessManager::sslErrors, this, &NvHTTP::handleSslErrors);
 }
 
+NvHTTP::NvHTTP(NvComputer* computer) :
+    NvHTTP(computer->activeAddress, computer->activeHttpsPort, computer->serverCert)
+{
+
+}
+
 void NvHTTP::setServerCert(QSslCertificate serverCert)
 {
     m_ServerCert = serverCert;
 }
 
-void NvHTTP::setAddress(QString address)
+void NvHTTP::setAddress(NvAddress address)
 {
-    Q_ASSERT(!address.isEmpty());
+    Q_ASSERT(!address.isNull());
 
     m_Address = address;
 
-    m_BaseUrlHttp.setHost(address);
-    m_BaseUrlHttps.setHost(address);
+    m_BaseUrlHttp.setHost(address.address());
+    m_BaseUrlHttps.setHost(address.address());
+
+    m_BaseUrlHttp.setPort(address.port());
 }
 
-QString NvHTTP::address()
+void NvHTTP::setHttpsPort(uint16_t port)
+{
+    m_BaseUrlHttps.setPort(port);
+}
+
+NvAddress NvHTTP::address()
 {
     return m_Address;
+}
+
+QSslCertificate NvHTTP::serverCert()
+{
+    return m_ServerCert;
+}
+
+uint16_t NvHTTP::httpPort()
+{
+    return m_BaseUrlHttp.port();
+}
+
+uint16_t NvHTTP::httpsPort()
+{
+    return m_BaseUrlHttps.port();
 }
 
 QVector<int>
@@ -98,8 +125,8 @@ NvHTTP::getServerInfo(NvLogLevel logLevel, bool fastFail)
 {
     QString serverInfo;
 
-    // Check if we have a pinned cert for this host yet
-    if (!m_ServerCert.isNull())
+    // Check if we have a pinned cert and HTTPS port for this host yet
+    if (!m_ServerCert.isNull() && httpsPort() != 0)
     {
         try
         {
@@ -134,24 +161,41 @@ NvHTTP::getServerInfo(NvLogLevel logLevel, bool fastFail)
     }
     else
     {
-        // Only use HTTP prior to pairing
+        // Only use HTTP prior to pairing or fetching HTTPS port
         serverInfo = openConnectionToString(m_BaseUrlHttp,
                                             "serverinfo",
                                             nullptr,
                                             fastFail ? FAST_FAIL_TIMEOUT_MS : REQUEST_TIMEOUT_MS,
                                             logLevel);
         verifyResponseStatus(serverInfo);
+
+        // Populate the HTTPS port
+        uint16_t httpsPort = getXmlString(serverInfo, "HttpsPort").toUShort();
+        if (httpsPort == 0) {
+            httpsPort = DEFAULT_HTTPS_PORT;
+        }
+        setHttpsPort(httpsPort);
+
+        // If we just needed to determine the HTTPS port, we'll try again over
+        // HTTPS now that we have the port number
+        if (!m_ServerCert.isNull()) {
+            return getServerInfo(logLevel, fastFail);
+        }
     }
 
     return serverInfo;
 }
 
 void
-NvHTTP::launchApp(int appId,
-                  PSTREAM_CONFIGURATION streamConfig,
-                  bool sops,
-                  bool localAudio,
-                  int gamepadMask)
+NvHTTP::startApp(QString verb,
+                 bool isGfe,
+                 int appId,
+                 PSTREAM_CONFIGURATION streamConfig,
+                 bool sops,
+                 bool localAudio,
+                 int gamepadMask,
+                 bool persistGameControllersOnDisconnect,
+                 QString& rtspSessionUrl)
 {
     int riKeyId;
 
@@ -160,49 +204,35 @@ NvHTTP::launchApp(int appId,
 
     QString response =
             openConnectionToString(m_BaseUrlHttps,
-                                   "launch",
+                                   verb,
                                    "appid="+QString::number(appId)+
                                    "&mode="+QString::number(streamConfig->width)+"x"+
                                    QString::number(streamConfig->height)+"x"+
                                    // Using an FPS value over 60 causes SOPS to default to 720p60,
                                    // so force it to 0 to ensure the correct resolution is set. We
                                    // used to use 60 here but that locked the frame rate to 60 FPS
-                                   // on GFE 3.20.3.
-                                   QString::number(streamConfig->fps > 60 ? 0 : streamConfig->fps)+
+                                   // on GFE 3.20.3. We don't need this hack for Sunshine.
+                                   QString::number((streamConfig->fps > 60 && isGfe) ? 0 : streamConfig->fps)+
                                    "&additionalStates=1&sops="+QString::number(sops ? 1 : 0)+
                                    "&rikey="+QByteArray(streamConfig->remoteInputAesKey, sizeof(streamConfig->remoteInputAesKey)).toHex()+
                                    "&rikeyid="+QString::number(riKeyId)+
-                                   (streamConfig->enableHdr ?
+                                   ((streamConfig->supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT) ?
                                        "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0" :
                                         "")+
                                    "&localAudioPlayMode="+QString::number(localAudio ? 1 : 0)+
                                    "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration))+
                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+
-                                   "&gcmap="+QString::number(gamepadMask),
+                                   "&gcmap="+QString::number(gamepadMask)+
+                                   "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
+                                   LiGetLaunchUrlQueryParameters(),
                                    LAUNCH_TIMEOUT_MS);
 
-    // Throws if the request failed
-    verifyResponseStatus(response);
-}
-
-void
-NvHTTP::resumeApp(PSTREAM_CONFIGURATION streamConfig)
-{
-    int riKeyId;
-
-    memcpy(&riKeyId, streamConfig->remoteInputAesIv, sizeof(riKeyId));
-    riKeyId = qFromBigEndian(riKeyId);
-
-    QString response =
-            openConnectionToString(m_BaseUrlHttps,
-                                   "resume",
-                                   "rikey="+QString(QByteArray(streamConfig->remoteInputAesKey, sizeof(streamConfig->remoteInputAesKey)).toHex())+
-                                   "&rikeyid="+QString::number(riKeyId)+
-                                   "&surroundAudioInfo="+QString::number(SURROUNDAUDIOINFO_FROM_AUDIO_CONFIGURATION(streamConfig->audioConfiguration)),
-                                   RESUME_TIMEOUT_MS);
+    qInfo() << "Launch response:" << response;
 
     // Throws if the request failed
     verifyResponseStatus(response);
+
+    rtspSessionUrl = getXmlString(response, "sessionUrl0");
 }
 
 void
@@ -214,11 +244,13 @@ NvHTTP::quitApp()
                                    nullptr,
                                    QUIT_TIMEOUT_MS);
 
+    qInfo() << "Quit response:" << response;
+
     // Throws if the request failed
     verifyResponseStatus(response);
 
     // Newer GFE versions will just return success even if quitting fails
-    // if we're not the original requestor.
+    // if we're not the original requester.
     if (getCurrentGame(getServerInfo(NvHTTP::NVLL_ERROR)) != 0) {
         // Generate a synthetic GfeResponseException letting the caller know
         // that they can't kill someone else's stream.
@@ -330,6 +362,8 @@ NvHTTP::verifyResponseStatus(QString xml)
             }
         }
     }
+
+    throw GfeHttpResponseException(-1, "Malformed XML (missing root element)");
 }
 
 QImage
@@ -435,6 +469,9 @@ NvHTTP::openConnection(QUrl baseUrl,
                        int timeoutMs,
                        NvLogLevel logLevel)
 {
+    // Port must be set
+    Q_ASSERT(baseUrl.port(0) != 0);
+
     // Build a URL for the request
     QUrl url(baseUrl);
     url.setPath("/" + command);
@@ -495,7 +532,7 @@ NvHTTP::openConnection(QUrl baseUrl,
     if (reply->error() != QNetworkReply::NoError)
     {
         if (logLevel >= NvLogLevel::NVLL_ERROR) {
-            qWarning() << command << " request failed with error " << reply->error();
+            qWarning() << command << "request failed with error:" << reply->error();
         }
 
         if (reply->error() == QNetworkReply::SslHandshakeFailedError) {

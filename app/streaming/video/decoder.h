@@ -15,10 +15,16 @@ typedef struct _VIDEO_STATS {
     uint32_t totalFrames;
     uint32_t networkDroppedFrames;
     uint32_t pacerDroppedFrames;
+    uint16_t minHostProcessingLatency;
+    uint16_t maxHostProcessingLatency;
+    uint32_t totalHostProcessingLatency;
+    uint32_t framesWithHostProcessingLatency;
     uint32_t totalReassemblyTime;
     uint32_t totalDecodeTime;
     uint32_t totalPacerTime;
     uint32_t totalRenderTime;
+    uint32_t lastRtt;
+    uint32_t lastRttVariance;
     float totalFps;
     float receivedFps;
     float decodedFps;
@@ -36,7 +42,23 @@ typedef struct _DECODER_PARAMETERS {
     int frameRate;
     bool enableVsync;
     bool enableFramePacing;
+    bool testOnly;
 } DECODER_PARAMETERS, *PDECODER_PARAMETERS;
+
+#define WINDOW_STATE_CHANGE_SIZE 0x01
+#define WINDOW_STATE_CHANGE_DISPLAY 0x02
+
+typedef struct _WINDOW_STATE_CHANGE_INFO {
+    SDL_Window* window;
+    uint32_t stateChangeFlags;
+
+    // Populated if WINDOW_STATE_CHANGE_SIZE is set
+    int width;
+    int height;
+
+    // Populated if WINDOW_STATE_CHANGE_DISPLAY is set
+    int displayIndex;
+} WINDOW_STATE_CHANGE_INFO, *PWINDOW_STATE_CHANGE_INFO;
 
 class IVideoDecoder {
 public:
@@ -44,9 +66,13 @@ public:
     virtual bool initialize(PDECODER_PARAMETERS params) = 0;
     virtual bool isHardwareAccelerated() = 0;
     virtual bool isAlwaysFullScreen() = 0;
+    virtual bool isHdrSupported() = 0;
     virtual int getDecoderCapabilities() = 0;
     virtual int getDecoderColorspace() = 0;
+    virtual int getDecoderColorRange() = 0;
     virtual QSize getDecoderMaxResolution() = 0;
     virtual int submitDecodeUnit(PDECODE_UNIT du) = 0;
     virtual void renderFrameOnMainThread() = 0;
+    virtual void setHdrMode(bool enabled) = 0;
+    virtual bool notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO info) = 0;
 };

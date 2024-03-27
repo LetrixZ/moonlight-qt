@@ -11,8 +11,8 @@
 
 #define REQUEST_TIMEOUT_MS 5000
 
-NvPairingManager::NvPairingManager(QString address) :
-    m_Http(address, QSslCertificate())
+NvPairingManager::NvPairingManager(NvComputer* computer) :
+    m_Http(computer)
 {
     QByteArray cert = IdentityManager::get()->getCertificate();
     BIO *bio = BIO_new_mem_buf(cert.data(), -1);
@@ -167,11 +167,7 @@ NvPairingManager::signMessage(const QByteArray& message)
     EVP_MD_CTX *ctx = EVP_MD_CTX_create();
     THROW_BAD_ALLOC_IF_NULL(ctx);
 
-    const EVP_MD *md = EVP_get_digestbyname("SHA256");
-    THROW_BAD_ALLOC_IF_NULL(md);
-
-    EVP_DigestInit_ex(ctx, md, NULL);
-    EVP_DigestSignInit(ctx, NULL, md, NULL, m_PrivateKey);
+    EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, m_PrivateKey);
     EVP_DigestSignUpdate(ctx, reinterpret_cast<unsigned char*>(const_cast<char*>(message.data())), message.length());
 
     size_t signatureLength = 0;
@@ -302,8 +298,8 @@ NvPairingManager::pair(QString appVersion, QString pin, QSslCertificate& serverC
     }
 
     QByteArray pairingSecret = NvHTTP::getXmlStringFromHex(respXml, "pairingsecret");
-    QByteArray serverSecret = QByteArray(pairingSecret.data(), 16);
-    QByteArray serverSignature = QByteArray(&pairingSecret.data()[16], 256);
+    QByteArray serverSecret = pairingSecret.left(16);
+    QByteArray serverSignature = pairingSecret.mid(16);
 
     if (!verifySignature(serverSecret,
                          serverSignature,

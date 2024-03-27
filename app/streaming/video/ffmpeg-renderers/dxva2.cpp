@@ -4,6 +4,7 @@
 
 #include <initguid.h>
 #include "dxva2.h"
+#include "dxutil.h"
 #include "../ffmpeg.h"
 #include <streaming/streamutils.h>
 #include <streaming/session.h>
@@ -18,6 +19,7 @@
 #include <Limelight.h>
 
 DEFINE_GUID(DXVADDI_Intel_ModeH264_E, 0x604F8E68,0x4951,0x4C54,0x88,0xFE,0xAB,0xD2,0x5C,0x15,0xB3,0xD6);
+DEFINE_GUID(DXVA2_ModeAV1_VLD_Profile0,0xb8be4ccb,0xcf53,0x46ba,0x8d,0x59,0xd6,0xb8,0xa6,0xda,0x5d,0x2a);
 
 #define SAFE_COM_RELEASE(x) if (x) { (x)->Release(); }
 
@@ -27,7 +29,8 @@ typedef struct _VERTEX
     float tu, tv;
 } VERTEX, *PVERTEX;
 
-DXVA2Renderer::DXVA2Renderer() :
+DXVA2Renderer::DXVA2Renderer(int decoderSelectionPass) :
+    m_DecoderSelectionPass(decoderSelectionPass),
     m_DecService(nullptr),
     m_Decoder(nullptr),
     m_SurfacesUsed(0),
@@ -38,7 +41,8 @@ DXVA2Renderer::DXVA2Renderer() :
     m_ProcService(nullptr),
     m_Processor(nullptr),
     m_FrameIndex(0),
-    m_BlockingPresent(false)
+    m_BlockingPresent(false),
+    m_DeviceQuirks(0)
 {
     RtlZeroMemory(m_DecSurfaces, sizeof(m_DecSurfaces));
     RtlZeroMemory(&m_DXVAContext, sizeof(m_DXVAContext));
@@ -83,7 +87,7 @@ void DXVA2Renderer::ffPoolDummyDelete(void*, uint8_t*)
     /* Do nothing */
 }
 
-AVBufferRef* DXVA2Renderer::ffPoolAlloc(void* opaque, int)
+AVBufferRef* DXVA2Renderer::ffPoolAlloc(void* opaque, FF_POOL_SIZE_TYPE)
 {
     DXVA2Renderer* me = reinterpret_cast<DXVA2Renderer*>(opaque);
 
@@ -109,6 +113,11 @@ bool DXVA2Renderer::prepareDecoderContext(AVCodecContext* context, AVDictionary*
     context->hwaccel_context = &m_DXVAContext;
 
     context->get_buffer2 = ffGetBuffer2;
+#if LIBAVCODEC_VERSION_MAJOR < 60
+    AV_NOWARN_DEPRECATED(
+        context->thread_safe_callbacks = 1;
+    )
+#endif
 
     m_Pool = av_buffer_pool_init2(ARRAYSIZE(m_DecSurfaces), this, ffPoolAlloc, nullptr);
     if (!m_Pool) {
@@ -190,6 +199,12 @@ bool DXVA2Renderer::initializeDecoder()
         }
         else if (m_VideoFormat == VIDEO_FORMAT_H265_MAIN10) {
             if (IsEqualGUID(guids[i], DXVA2_ModeHEVC_VLD_Main10)) {
+                chosenDeviceGuid = guids[i];
+                break;
+            }
+        }
+        else if (m_VideoFormat == VIDEO_FORMAT_AV1_MAIN8 || m_VideoFormat == VIDEO_FORMAT_AV1_MAIN10) {
+            if (IsEqualGUID(guids[i], DXVA2_ModeAV1_VLD_Profile0)) {
                 chosenDeviceGuid = guids[i];
                 break;
             }
@@ -280,7 +295,7 @@ bool DXVA2Renderer::initializeRenderer()
     m_DisplayWidth = renderTargetDesc.Width;
     m_DisplayHeight = renderTargetDesc.Height;
 
-    if (!isDXVideoProcessorAPIBlacklisted()) {
+    if (!(m_DeviceQuirks & DXVA2_QUIRK_NO_VP)) {
         hr = DXVA2CreateVideoService(m_Device, IID_IDirectXVideoProcessorService,
                                      reinterpret_cast<void**>(&m_ProcService));
 
@@ -361,67 +376,87 @@ bool DXVA2Renderer::initializeRenderer()
     return true;
 }
 
-bool DXVA2Renderer::isDXVideoProcessorAPIBlacklisted()
+bool DXVA2Renderer::initializeQuirksForAdapter(IDirect3D9Ex* d3d9ex, int adapterIndex)
 {
-    IDirect3D9* d3d9;
     HRESULT hr;
-    bool result = false;
 
-    if (qgetenv("DXVA2_DISABLE_VIDPROC_BLACKLIST") == "1") {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "IDirectXVideoProcessor blacklist is disabled");
-        return false;
+    SDL_assert(m_DeviceQuirks == 0);
+    SDL_assert(m_Device == nullptr);
+
+    {
+        bool ok;
+
+        m_DeviceQuirks = qEnvironmentVariableIntValue("DXVA2_QUIRK_FLAGS", &ok);
+        if (ok) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Using DXVA2 quirk override: 0x%x",
+                        m_DeviceQuirks);
+            return true;
+        }
     }
 
-    hr = m_Device->GetDirect3D(&d3d9);
+    UINT adapterCount = d3d9ex->GetAdapterCount();
+    if (adapterCount > 1) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Detected multi-GPU system with %d GPUs",
+                    adapterCount);
+        m_DeviceQuirks |= DXVA2_QUIRK_MULTI_GPU;
+    }
+
+    D3DCAPS9 caps;
+    hr = d3d9ex->GetDeviceCaps(adapterIndex, D3DDEVTYPE_HAL, &caps);
     if (SUCCEEDED(hr)) {
-        D3DCAPS9 caps;
+        D3DADAPTER_IDENTIFIER9 id;
 
-        hr = m_Device->GetDeviceCaps(&caps);
+        hr = d3d9ex->GetAdapterIdentifier(adapterIndex, 0, &id);
         if (SUCCEEDED(hr)) {
-            D3DADAPTER_IDENTIFIER9 id;
+            if (id.VendorId == 0x8086) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Avoiding IDirectXVideoProcessor API on Intel GPU");
 
-            hr = d3d9->GetAdapterIdentifier(caps.AdapterOrdinal, 0, &id);
-            if (SUCCEEDED(hr)) {
-                if (id.VendorId == 0x8086) {
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "Avoiding IDirectXVideoProcessor API on Intel GPU");
-
-                    // On Intel GPUs, we can get unwanted video "enhancements" due to post-processing
-                    // effects that the GPU driver forces on us. In many cases, this makes the video
-                    // actually look worse. We can avoid these by using StretchRect() instead on these
-                    // platforms.
-                    result = true;
-                }
-                else if (id.VendorId == 0x4d4f4351) { // QCOM in ASCII
-                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "Avoiding IDirectXVideoProcessor API on Qualcomm GPU");
-
-                    // On Qualcomm GPUs (all D3D9on12 GPUs?), the scaling quality of VideoProcessBlt()
-                    // is absolutely horrible. StretchRect() is much much better.
-                    result = true;
-                }
-                else {
-                    result = false;
-                }
+                // On Intel GPUs, we can get unwanted video "enhancements" due to post-processing
+                // effects that the GPU driver forces on us. In many cases, this makes the video
+                // actually look worse. We can avoid these by using StretchRect() instead on these
+                // platforms.
+                m_DeviceQuirks |= DXVA2_QUIRK_NO_VP;
             }
-            else {
-                result = false;
+            else if (id.VendorId == 0x4d4f4351) { // QCOM in ASCII
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Avoiding IDirectXVideoProcessor API on Qualcomm GPU");
+
+                // On Qualcomm GPUs (all D3D9on12 GPUs?), the scaling quality of VideoProcessBlt()
+                // is absolutely horrible. StretchRect() is much much better.
+                m_DeviceQuirks |= DXVA2_QUIRK_NO_VP;
+            }
+            else if (id.VendorId == 0x1002 &&
+                     (id.DriverVersion.HighPart > 0x1E0000 ||
+                      (id.DriverVersion.HighPart == 0x1E0000 && HIWORD(id.DriverVersion.LowPart) >= 14000))) { // AMD 21.12.1 or later
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Using DestFormat quirk for recent AMD GPU driver");
+
+                // AMD's GPU driver doesn't correctly handle color range conversion.
+                //
+                // This used to just work because we used Rec 709 Limited which happened to be what AMD's
+                // driver defaulted to. However, AMD's driver behavior changed to default to Rec 709 Full
+                // in the 21.12.1 driver, so we must adapt to that.
+                //
+                // 30.0.13037.1003 - 21.11.3 - Limited
+                // 30.0.14011.3017 - 21.12.1 - Full
+                //
+                // To sort out this mess, we will use a quirk to tell us to populate DestFormat for AMD.
+                // For other GPUs, we'll avoid populating it as was our previous behavior.
+                m_DeviceQuirks |= DXVA2_QUIRK_SET_DEST_FORMAT;
             }
         }
-        else {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "GetDeviceCaps() failed: %x", hr);
-        }
 
-        d3d9->Release();
+        return true;
     }
     else {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "GetDirect3D() failed: %x", hr);
+                     "GetDeviceCaps() failed: %x", hr);
     }
 
-    return result;
+    return false;
 }
 
 bool DXVA2Renderer::isDecoderBlacklisted()
@@ -459,88 +494,24 @@ bool DXVA2Renderer::isDecoderBlacklisted()
                             HIWORD(id.DriverVersion.LowPart),
                             LOWORD(id.DriverVersion.LowPart));
 
-                if (id.VendorId == 0x8086) {
-                    // Intel seems to encode the series in the high byte of
-                    // the device ID. We want to avoid the "Partial" acceleration
-                    // support explicitly. Those will claim to have HW acceleration
-                    // but perform badly.
-                    // https://en.wikipedia.org/wiki/Intel_Graphics_Technology#Capabilities_(GPU_video_acceleration)
-                    // https://raw.githubusercontent.com/GameTechDev/gpudetect/master/IntelGfx.cfg
-                    switch (id.DeviceId & 0xFF00) {
-                    case 0x0400: // Haswell
-                    case 0x0A00: // Haswell
-                    case 0x0D00: // Haswell
-                    case 0x1600: // Broadwell
-                    case 0x2200: // Cherry Trail and Braswell
-                        // Blacklist these for HEVC to avoid hybrid decode
-                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "GPU blacklisted for HEVC due to hybrid decode");
-                        result = (m_VideoFormat & VIDEO_FORMAT_MASK_H265) != 0;
-                        break;
-                    case 0x1900: // Skylake
-                        // Blacklist these for HEVC Main10 to avoid hybrid decode.
-                        // Regular HEVC Main is fine though.
-                        if (m_VideoFormat == VIDEO_FORMAT_H265_MAIN10) {
-                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                        "GPU blacklisted for HEVC Main10 due to hybrid decode");
-                            result = false;
-                            break;
-                        }
-                    default:
-                        // Intel drivers from before late-2017 had a bug that caused some strange artifacts
-                        // when decoding HEVC. Avoid HEVC on drivers prior to build 4836 which I confirmed
-                        // is not affected on my Intel HD 515.
-                        // https://github.com/moonlight-stream/moonlight-qt/issues/32
-                        // https://www.intel.com/content/www/us/en/support/articles/000005654/graphics-drivers.html
-                        if (LOWORD(id.DriverVersion.LowPart) < 4836) {
-                            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                        "Detected buggy Intel GPU driver installed. Update your Intel GPU driver to enable HEVC!");
-                            result = (m_VideoFormat & VIDEO_FORMAT_MASK_H265) != 0;
-                        }
-                        else {
-                            // Everything else is fine with whatever it says it supports
-                            result = false;
-                        }
-                        break;
-                    }
+                if (DXUtil::isFormatHybridDecodedByHardware(m_VideoFormat, id.VendorId, id.DeviceId)) {
+                    result = true;
                 }
-                else if (id.VendorId == 0x10DE) {
-                    // For NVIDIA, we wait to avoid those GPUs with Feature Set E
-                    // for HEVC decoding, since that's hybrid. It appears that Kepler GPUs
-                    // also had some hybrid decode support (per DXVA2 Checker) so we'll
-                    // blacklist those too.
-                    // https://en.wikipedia.org/wiki/Nvidia_PureVideo
-                    // https://bluesky23.yukishigure.com/en/dxvac/deviceInfo/decoder.html
-                    // http://envytools.readthedocs.io/en/latest/hw/pciid.html (missing GM200)
-                    if ((id.DeviceId >= 0x1180 && id.DeviceId <= 0x11BF) || // GK104
-                            (id.DeviceId >= 0x11C0 && id.DeviceId <= 0x11FF) || // GK106
-                            (id.DeviceId >= 0x0FC0 && id.DeviceId <= 0x0FFF) || // GK107
-                            (id.DeviceId >= 0x1000 && id.DeviceId <= 0x103F) || // GK110/GK110B
-                            (id.DeviceId >= 0x1280 && id.DeviceId <= 0x12BF) || // GK208
-                            (id.DeviceId >= 0x1340 && id.DeviceId <= 0x137F) || // GM108
-                            (id.DeviceId >= 0x1380 && id.DeviceId <= 0x13BF) || // GM107
-                            (id.DeviceId >= 0x13C0 && id.DeviceId <= 0x13FF) || // GM204
-                            (id.DeviceId >= 0x1617 && id.DeviceId <= 0x161A) || // GM204
-                            (id.DeviceId == 0x1667) || // GM204
-                            (id.DeviceId >= 0x17C0 && id.DeviceId <= 0x17FF)) { // GM200
-                        // Avoid HEVC on Feature Set E GPUs
-                        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "GPU blacklisted for HEVC due to hybrid decode");
-                        result = (m_VideoFormat & VIDEO_FORMAT_MASK_H265) != 0;
-                    }
-                    else {
-                        result = false;
-                    }
+                // Intel drivers from before late-2017 had a bug that caused some strange artifacts
+                // when decoding HEVC. Avoid HEVC on drivers prior to build 4836 which I confirmed
+                // is not affected on my Intel HD 515. Also account for the driver version rollover
+                // that happened with the 101.1069 series.
+                // https://github.com/moonlight-stream/moonlight-qt/issues/32
+                // https://www.intel.com/content/www/us/en/support/articles/000005654/graphics-drivers.html
+                else if (id.VendorId == 0x8086 && HIWORD(id.DriverVersion.LowPart) < 100 && LOWORD(id.DriverVersion.LowPart) < 4836) {
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "Detected buggy Intel GPU driver installed. Update your Intel GPU driver to enable HEVC!");
+                    result = (m_VideoFormat & VIDEO_FORMAT_MASK_H265) != 0;
                 }
-                else if (id.VendorId == 0x1002) {
-                    // AMD doesn't seem to do hybrid acceleration?
-                    result = false;
-                }
-                else {
-                    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                                "Unrecognized vendor ID: %x",
-                                id.VendorId);
-                }
+            }
+            else {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "GetAdapterIdentifier() failed: %x", hr);
             }
         }
         else {
@@ -557,7 +528,7 @@ bool DXVA2Renderer::isDecoderBlacklisted()
 
     if (result) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "GPU blacklisted for format %x",
+                    "GPU decoding for format %x is blocked due to hardware limitations",
                     m_VideoFormat);
     }
 
@@ -583,6 +554,13 @@ bool DXVA2Renderer::initializeDevice(SDL_Window* window, bool enableVsync)
     int adapterIndex = SDL_Direct3D9GetAdapterIndex(SDL_GetWindowDisplayIndex(window));
     Uint32 windowFlags = SDL_GetWindowFlags(window);
 
+    // Initialize quirks *before* calling CreateDeviceEx() to allow our below
+    // logic to avoid a hang with NahimicOSD.dll's broken full-screen handling.
+    if (!initializeQuirksForAdapter(d3d9ex, adapterIndex)) {
+        d3d9ex->Release();
+        return false;
+    }
+
     D3DCAPS9 deviceCaps;
     d3d9ex->GetDeviceCaps(adapterIndex, D3DDEVTYPE_HAL, &deviceCaps);
 
@@ -594,7 +572,7 @@ bool DXVA2Renderer::initializeDevice(SDL_Window* window, bool enableVsync)
     d3dpp.hDeviceWindow = info.info.win.window;
     d3dpp.Flags = D3DPRESENTFLAG_VIDEO;
 
-    if (m_VideoFormat == VIDEO_FORMAT_H265_MAIN10) {
+    if (m_VideoFormat & VIDEO_FORMAT_MASK_10BIT) {
         // Verify 10-bit A2R10G10B10 color support. This is only available
         // as a display format in full-screen exclusive mode on DX9.
         hr = d3d9ex->CheckDeviceType(adapterIndex,
@@ -616,7 +594,7 @@ bool DXVA2Renderer::initializeDevice(SDL_Window* window, bool enableVsync)
         d3dpp.BackBufferHeight = currentMode.Height;
         d3dpp.FullScreen_RefreshRateInHz = currentMode.RefreshRate;
 
-        if (m_VideoFormat == VIDEO_FORMAT_H265_MAIN10) {
+        if (m_VideoFormat & VIDEO_FORMAT_MASK_10BIT) {
             d3dpp.BackBufferFormat = currentMode.Format = D3DFMT_A2R10G10B10;
         }
         else {
@@ -636,20 +614,18 @@ bool DXVA2Renderer::initializeDevice(SDL_Window* window, bool enableVsync)
         // If composition enabled, disable v-sync and let DWM manage things
         // to reduce latency by avoiding double v-syncing.
         d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+        d3dpp.SwapEffect = D3DSWAPEFFECT_FLIPEX;
 
-        // If V-sync is enabled (not rendering faster than display),
-        // we can use FlipEx for more efficient swapping.
         if (enableVsync) {
-            // D3DSWAPEFFECT_FLIPEX requires at least 2 back buffers to allow us to
+            // D3DSWAPEFFECT_FLIPEX requires at least 3 back buffers to allow us to
             // continue while DWM is waiting to render the surface to the display.
-            d3dpp.SwapEffect = D3DSWAPEFFECT_FLIPEX;
-            d3dpp.BackBufferCount = 2;
+            // NVIDIA seems to be fine with 2, but AMD needs 3 to perform well.
+            d3dpp.BackBufferCount = 3;
         }
         else {
-            // With V-sync off, we won't use FlipEx because that will block while
-            // DWM is waiting to render our surface (effectively behaving like V-Sync).
-            d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-            d3dpp.BackBufferCount = 1;
+            // With V-sync off, we need 1 more back buffer to render to while the
+            // driver/DWM are holding the others.
+            d3dpp.BackBufferCount = 4;
         }
 
         m_BlockingPresent = false;
@@ -714,12 +690,17 @@ bool DXVA2Renderer::initializeDevice(SDL_Window* window, bool enableVsync)
         return false;
     }
 
-    hr = m_Device->SetMaximumFrameLatency(1);
-    if (FAILED(hr)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "SetMaximumFrameLatency() failed: %x",
-                     hr);
-        return false;
+    // We must not call this for flip swapchains. It will counterintuitively
+    // increase latency by forcing our Present() to block on DWM even when
+    // using D3DPRESENT_INTERVAL_IMMEDIATE.
+    if (d3dpp.SwapEffect != D3DSWAPEFFECT_FLIPEX) {
+        hr = m_Device->SetMaximumFrameLatency(1);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "SetMaximumFrameLatency() failed: %x",
+                         hr);
+            return false;
+        }
     }
 
     return true;
@@ -727,6 +708,24 @@ bool DXVA2Renderer::initializeDevice(SDL_Window* window, bool enableVsync)
 
 bool DXVA2Renderer::initialize(PDECODER_PARAMETERS params)
 {
+    if (qgetenv("DXVA2_ENABLED") == "0") {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "DXVA2 is disabled by environment variable");
+        return false;
+    }
+    else if ((params->videoFormat & VIDEO_FORMAT_MASK_10BIT) && m_DecoderSelectionPass == 0) {
+        // Avoid using DXVA2 for HDR10. While it can render 10-bit color, it doesn't support
+        // the HDR colorspace and HDR display metadata required to enable HDR mode properly.
+        return false;
+    }
+#ifndef Q_PROCESSOR_X86
+    else if (qgetenv("DXVA2_ENABLED") != "1" && m_DecoderSelectionPass == 0) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "DXVA2 is disabled by default on ARM64. Set DXVA2_ENABLED=1 to override.");
+        return false;
+    }
+#endif
+
     m_VideoFormat = params->videoFormat;
     m_VideoWidth = params->width;
     m_VideoHeight = params->height;
@@ -735,16 +734,20 @@ bool DXVA2Renderer::initialize(PDECODER_PARAMETERS params)
 
     int alignment;
 
-    // HEVC using DXVA requires 128 pixel alignment, however Intel GPUs decoding HEVC
-    // using StretchRect() to render draw a translucent green line at the top of
+    // HEVC and AV1 using DXVA requires 128 pixel alignment, however this causes Intel GPUs
+    // using StretchRect() and HEVC to render draw a translucent green line at the top of
     // the screen in full-screen mode at 720p/1080p unless we use 32 pixel alignment.
     // This appears to work without issues on AMD and Nvidia GPUs too, so we will
     // do it unconditionally for now.
+    // https://github.com/FFmpeg/FFmpeg/blob/a234e5cd80224c95a205c1f3e297d8c04a1374c3/libavcodec/dxva2.c#L609-L616
     if (m_VideoFormat & VIDEO_FORMAT_MASK_H265) {
         alignment = 32;
     }
-    else {
+    else if (m_VideoFormat & VIDEO_FORMAT_MASK_H264) {
         alignment = 16;
+    }
+    else {
+        alignment = 128;
     }
 
     m_Desc.SampleWidth = FFALIGN(m_VideoWidth, alignment);
@@ -757,7 +760,7 @@ bool DXVA2Renderer::initialize(PDECODER_PARAMETERS params)
     m_Desc.SampleFormat.VideoTransferFunction = DXVA2_VideoTransFunc_Unknown;
     m_Desc.SampleFormat.SampleFormat = DXVA2_SampleProgressiveFrame;
 
-    if (m_VideoFormat == VIDEO_FORMAT_H265_MAIN10) {
+    if (m_VideoFormat & VIDEO_FORMAT_MASK_10BIT) {
         m_Desc.Format = (D3DFORMAT)MAKEFOURCC('P','0','1','0');
     }
     else {
@@ -791,7 +794,8 @@ void DXVA2Renderer::notifyOverlayUpdated(Overlay::OverlayType type)
     HRESULT hr;
 
     SDL_Surface* newSurface = Session::get()->getOverlayManager().getUpdatedOverlaySurface(type);
-    if (newSurface == nullptr && Session::get()->getOverlayManager().isOverlayEnabled(type)) {
+    bool overlayEnabled = Session::get()->getOverlayManager().isOverlayEnabled(type);
+    if (newSurface == nullptr && overlayEnabled) {
         // The overlay is enabled and there is no new surface. Leave the old texture alone.
         return;
     }
@@ -808,7 +812,7 @@ void DXVA2Renderer::notifyOverlayUpdated(Overlay::OverlayType type)
     SAFE_COM_RELEASE(oldVertexBuffer);
 
     // If the overlay is disabled, we're done
-    if (!Session::get()->getOverlayManager().isOverlayEnabled(type)) {
+    if (!overlayEnabled) {
         SDL_FreeSurface(newSurface);
         return;
     }
@@ -843,19 +847,9 @@ void DXVA2Renderer::notifyOverlayUpdated(Overlay::OverlayType type)
         return;
     }
 
-    if (newSurface->pitch == lockedRect.Pitch) {
-        // If the pitch matches, we can take the fast path and use a single copy to transfer the pixels
-        RtlCopyMemory(lockedRect.pBits, newSurface->pixels, newSurface->pitch * newSurface->h);
-    }
-    else {
-        // If the pitch doesn't match, we'll need to copy each row separately
-        int pitch = SDL_min(newSurface->pitch, lockedRect.Pitch);
-        for (int i = 0; i < newSurface->h; i++) {
-            RtlCopyMemory(((PUCHAR)lockedRect.pBits) + (lockedRect.Pitch * i),
-                          ((PUCHAR)newSurface->pixels) + (newSurface->pitch * i),
-                          pitch);
-        }
-    }
+    // Copy (and convert, if necessary) the surface pixels to the texture
+    SDL_ConvertPixels(newSurface->w, newSurface->h, newSurface->format->format, newSurface->pixels,
+                      newSurface->pitch, SDL_PIXELFORMAT_ARGB8888, lockedRect.pBits, lockedRect.Pitch);
 
     newTexture->UnlockRect(0);
 
@@ -983,39 +977,31 @@ Exit:
 
 int DXVA2Renderer::getDecoderColorspace()
 {
-    if (isDXVideoProcessorAPIBlacklisted()) {
+    if (m_DeviceQuirks & DXVA2_QUIRK_NO_VP) {
         // StretchRect() assumes Rec 601 on Intel and Qualcomm GPUs.
         return COLORSPACE_REC_601;
     }
     else {
-        // VideoProcessBlt() *should* properly handle whatever, since
-        // we provide colorspace information. However, AMD GPUs seem to
-        // always assume Rec 709, so we'll use that as our default.
+        // VideoProcessBlt() should properly handle whatever, since
+        // we provide colorspace information. We used to use this because
+        // we didn't know how to get AMD to respect the requested colorspace,
+        // but now it's just because it's what we used before.
         return COLORSPACE_REC_709;
     }
 }
 
+int DXVA2Renderer::getDecoderCapabilities()
+{
+    return CAPABILITY_REFERENCE_FRAME_INVALIDATION_HEVC |
+           CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1;
+}
+
 void DXVA2Renderer::renderFrame(AVFrame *frame)
 {
-    if (frame == nullptr) {
-        // End of stream - nothing to do for us
-        return;
-    }
-
     IDirect3DSurface9* surface = reinterpret_cast<IDirect3DSurface9*>(frame->data[3]);
     HRESULT hr;
 
-    switch (frame->color_range) {
-    case AVCOL_RANGE_JPEG:
-        m_Desc.SampleFormat.NominalRange = DXVA2_NominalRange_0_255;
-        break;
-    case AVCOL_RANGE_MPEG:
-        m_Desc.SampleFormat.NominalRange = DXVA2_NominalRange_16_235;
-        break;
-    default:
-        m_Desc.SampleFormat.NominalRange = DXVA2_NominalRange_Unknown;
-        break;
-    }
+    m_Desc.SampleFormat.NominalRange = isFrameFullRange(frame) ? DXVA2_NominalRange_0_255 : DXVA2_NominalRange_16_235;
 
     switch (frame->color_primaries) {
     case AVCOL_PRI_BT709:
@@ -1063,16 +1049,12 @@ void DXVA2Renderer::renderFrame(AVFrame *frame)
         break;
     }
 
-    switch (frame->colorspace) {
-    case AVCOL_SPC_BT709:
+    switch (getFrameColorspace(frame)) {
+    case COLORSPACE_REC_709:
         m_Desc.SampleFormat.VideoTransferMatrix = DXVA2_VideoTransferMatrix_BT709;
         break;
-    case AVCOL_SPC_BT470BG:
-    case AVCOL_SPC_SMPTE170M:
+    case COLORSPACE_REC_601:
         m_Desc.SampleFormat.VideoTransferMatrix = DXVA2_VideoTransferMatrix_BT601;
-        break;
-    case AVCOL_SPC_SMPTE240M:
-        m_Desc.SampleFormat.VideoTransferMatrix = DXVA2_VideoTransferMatrix_SMPTE240M;
         break;
     default:
         m_Desc.SampleFormat.VideoTransferMatrix = DXVA2_VideoTransferMatrix_Unknown;
@@ -1082,14 +1064,17 @@ void DXVA2Renderer::renderFrame(AVFrame *frame)
     switch (frame->chroma_location) {
     case AVCHROMA_LOC_LEFT:
         m_Desc.SampleFormat.VideoChromaSubsampling = DXVA2_VideoChromaSubsampling_Horizontally_Cosited |
-                                                     DXVA2_VideoChromaSubsampling_Vertically_AlignedChromaPlanes;
+                                                     DXVA2_VideoChromaSubsampling_Vertically_AlignedChromaPlanes |
+                                                     DXVA2_VideoChromaSubsampling_ProgressiveChroma;
         break;
     case AVCHROMA_LOC_CENTER:
-        m_Desc.SampleFormat.VideoChromaSubsampling = DXVA2_VideoChromaSubsampling_Vertically_AlignedChromaPlanes;
+        m_Desc.SampleFormat.VideoChromaSubsampling = DXVA2_VideoChromaSubsampling_Vertically_AlignedChromaPlanes |
+                                                     DXVA2_VideoChromaSubsampling_ProgressiveChroma;
         break;
     case AVCHROMA_LOC_TOPLEFT:
         m_Desc.SampleFormat.VideoChromaSubsampling = DXVA2_VideoChromaSubsampling_Horizontally_Cosited |
-                                                     DXVA2_VideoChromaSubsampling_Vertically_Cosited;
+                                                     DXVA2_VideoChromaSubsampling_Vertically_Cosited |
+                                                     DXVA2_VideoChromaSubsampling_ProgressiveChroma;
         break;
     default:
         m_Desc.SampleFormat.VideoChromaSubsampling = DXVA2_VideoChromaSubsampling_Unknown;
@@ -1127,7 +1112,12 @@ void DXVA2Renderer::renderFrame(AVFrame *frame)
     bltParams.TargetRect = sample.DstRect;
     bltParams.BackgroundColor.Alpha = 0xFFFF;
 
-    bltParams.DestFormat.SampleFormat = DXVA2_SampleProgressiveFrame;
+    if (m_DeviceQuirks & DXVA2_QUIRK_SET_DEST_FORMAT) {
+        bltParams.DestFormat = m_Desc.SampleFormat;
+    }
+    else {
+        bltParams.DestFormat.SampleFormat = DXVA2_SampleProgressiveFrame;
+    }
 
     bltParams.ProcAmpValues.Brightness = m_BrightnessRange.DefaultValue;
     bltParams.ProcAmpValues.Contrast = m_ContrastRange.DefaultValue;
@@ -1170,6 +1160,9 @@ void DXVA2Renderer::renderFrame(AVFrame *frame)
     }
 
     if (!m_Processor) {
+        // StretchRect() assumes Rec 601 on Intel and Qualcomm GPUs.
+        SDL_assert(m_Desc.SampleFormat.VideoTransferMatrix == DXVA2_VideoTransferMatrix_BT601);
+
         // This function doesn't trigger any of Intel's garbage video "enhancements"
         hr = m_Device->StretchRect(surface, &sample.SrcRect, m_RenderTarget, &sample.DstRect, D3DTEXF_NONE);
         if (FAILED(hr)) {

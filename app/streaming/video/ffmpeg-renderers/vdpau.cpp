@@ -1,6 +1,7 @@
 #include <streaming/session.h>
 #include "vdpau.h"
 #include <streaming/streamutils.h>
+#include <utils.h>
 
 #include <SDL_syswm.h>
 
@@ -93,6 +94,36 @@ bool VDPAURenderer::initialize(PDECODER_PARAMETERS params)
     #endif
     };
 
+    SDL_VERSION(&info.version);
+
+    if (!SDL_GetWindowWMInfo(params->window, &info)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "SDL_GetWindowWMInfo() failed: %s",
+                     SDL_GetError());
+        return false;
+    }
+
+    if (info.subsystem == SDL_SYSWM_WAYLAND) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "VDPAU is not supported on Wayland");
+        return false;
+    }
+    else if (info.subsystem != SDL_SYSWM_X11) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "VDPAU is not supported on the current subsystem: %d",
+                     info.subsystem);
+        return false;
+    }
+    else if (qgetenv("VDPAU_XWAYLAND") != "1" && WMUtils::isRunningWayland()) {
+        // VDPAU initialization causes Moonlight to crash when using XWayland in a Flatpak
+        // on a system with the Nvidia 495.44 driver. VDPAU won't work under XWayland anyway,
+        // so let's not risk trying it (unless the user wants to roll the dice).
+        // https://gitlab.freedesktop.org/vdpau/libvdpau/-/issues/2
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "VDPAU is disabled on XWayland. Set VDPAU_XWAYLAND=1 to try your luck.");
+        return false;
+    }
+
     m_VideoWidth = params->width;
     m_VideoHeight = params->height;
 
@@ -158,39 +189,17 @@ bool VDPAURenderer::initialize(PDECODER_PARAMETERS params)
 
     SDL_GetWindowSize(params->window, (int*)&m_DisplayWidth, (int*)&m_DisplayHeight);
 
-    SDL_VERSION(&info.version);
-
-    if (!SDL_GetWindowWMInfo(params->window, &info)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "SDL_GetWindowWMInfo() failed: %s",
-                     SDL_GetError());
-        return false;
-    }
-
     SDL_assert(info.subsystem == SDL_SYSWM_X11);
 
-    if (info.subsystem == SDL_SYSWM_X11) {
-        GET_PROC_ADDRESS(VDP_FUNC_ID_PRESENTATION_QUEUE_TARGET_CREATE_X11,
-                         &m_VdpPresentationQueueTargetCreateX11);
-        status = m_VdpPresentationQueueTargetCreateX11(m_Device,
-                                                       info.info.x11.window,
-                                                       &m_PresentationQueueTarget);
-        if (status != VDP_STATUS_OK) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "VdpPresentationQueueTargetCreateX11() failed: %s",
-                         m_VdpGetErrorString(status));
-            return false;
-        }
-    }
-    else if (info.subsystem == SDL_SYSWM_WAYLAND) {
+    GET_PROC_ADDRESS(VDP_FUNC_ID_PRESENTATION_QUEUE_TARGET_CREATE_X11,
+                     &m_VdpPresentationQueueTargetCreateX11);
+    status = m_VdpPresentationQueueTargetCreateX11(m_Device,
+                                                   info.info.x11.window,
+                                                   &m_PresentationQueueTarget);
+    if (status != VDP_STATUS_OK) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "VDPAU backend does not currently support Wayland");
-        return false;
-    }
-    else {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "Unsupported VDPAU rendering subsystem: %d",
-                     info.subsystem);
+                     "VdpPresentationQueueTargetCreateX11() failed: %s",
+                     m_VdpGetErrorString(status));
         return false;
     }
 
@@ -207,7 +216,7 @@ bool VDPAURenderer::initialize(PDECODER_PARAMETERS params)
         VdpBool supported;
         uint32_t maxWidth, maxHeight;
         VdpRGBAFormat candidateFormat =
-                params->videoFormat == VIDEO_FORMAT_H265_MAIN10 ?
+                (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) ?
                     k_OutputFormats10Bit[i] : k_OutputFormats8Bit[i];
 
         status = m_VdpOutputSurfaceQueryCapabilities(m_Device, candidateFormat,
@@ -324,7 +333,8 @@ void VDPAURenderer::notifyOverlayUpdated(Overlay::OverlayType type)
     VdpStatus status;
 
     SDL_Surface* newSurface = Session::get()->getOverlayManager().getUpdatedOverlaySurface(type);
-    if (newSurface == nullptr && Session::get()->getOverlayManager().isOverlayEnabled(type)) {
+    bool overlayEnabled = Session::get()->getOverlayManager().isOverlayEnabled(type);
+    if (newSurface == nullptr && overlayEnabled) {
         // There's no updated surface and the overlay is enabled, so just leave the old surface alone.
         return;
     }
@@ -349,13 +359,14 @@ void VDPAURenderer::notifyOverlayUpdated(Overlay::OverlayType type)
         }
     }
 
-    if (!Session::get()->getOverlayManager().isOverlayEnabled(type)) {
+    if (!overlayEnabled) {
         SDL_FreeSurface(newSurface);
         return;
     }
 
     if (newSurface != nullptr) {
         SDL_assert(!SDL_MUSTLOCK(newSurface));
+        SDL_assert(newSurface->format->format == SDL_PIXELFORMAT_ARGB8888);
 
         VdpBitmapSurface newBitmapSurface = 0;
         status = m_VdpBitmapSurfaceCreate(m_Device,
@@ -427,6 +438,12 @@ int VDPAURenderer::getDecoderColorspace()
     return COLORSPACE_REC_601;
 }
 
+int VDPAURenderer::getDecoderCapabilities()
+{
+    return CAPABILITY_REFERENCE_FRAME_INVALIDATION_HEVC |
+           CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1;
+}
+
 void VDPAURenderer::renderOverlay(VdpOutputSurface destination, Overlay::OverlayType type)
 {
     VdpStatus status;
@@ -465,13 +482,17 @@ void VDPAURenderer::renderOverlay(VdpOutputSurface destination, Overlay::Overlay
     }
 }
 
+void VDPAURenderer::waitToRender()
+{
+    VdpOutputSurface chosenSurface = m_OutputSurface[m_NextSurfaceIndex];
+
+    // Wait for the next render target surface to be idle before proceeding
+    VdpTime pts;
+    m_VdpPresentationQueueBlockUntilSurfaceIdle(m_PresentationQueue, chosenSurface, &pts);
+}
+
 void VDPAURenderer::renderFrame(AVFrame* frame)
 {
-    if (frame == nullptr) {
-        // End of stream - nothing to do for us
-        return;
-    }
-
     VdpStatus status;
     VdpVideoSurface videoSurface = (VdpVideoSurface)(uintptr_t)frame->data[3];
 
@@ -520,7 +541,9 @@ void VDPAURenderer::renderFrame(AVFrame* frame)
         }
     }
 
-    // Wait for this frame to be off the screen
+    // Wait for this frame to be off the screen. This will usually be a no-op
+    // since it already happened in waitToRender(). However, that won't be the
+    // case is when frame pacing is enabled.
     VdpTime pts;
     m_VdpPresentationQueueBlockUntilSurfaceIdle(m_PresentationQueue, chosenSurface, &pts);
 

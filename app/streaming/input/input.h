@@ -5,10 +5,6 @@
 
 #include <SDL.h>
 
-#define SDL_CODE_HIDE_CURSOR 1
-#define SDL_CODE_SHOW_CURSOR 2
-#define SDL_CODE_UNCAPTURE_MOUSE 3
-
 struct GamepadState {
     SDL_GameController* controller;
     SDL_JoystickID jsId;
@@ -23,32 +19,28 @@ struct GamepadState {
     SDL_TimerID mouseEmulationTimer;
     uint32_t lastStartDownTime;
 
-    short buttons;
+    bool clickpadButtonEmulationEnabled;
+    bool emulatedClickpadButtonDown;
+
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    uint8_t gyroReportPeriodMs;
+    float lastGyroEventData[SDL_arraysize(SDL_ControllerSensorEvent::data)];
+    uint32_t lastGyroEventTime;
+
+    uint8_t accelReportPeriodMs;
+    float lastAccelEventData[SDL_arraysize(SDL_ControllerSensorEvent::data)];
+    uint32_t lastAccelEventTime;
+#endif
+
+    int buttons;
     short lsX, lsY;
     short rsX, rsY;
     unsigned char lt, rt;
 };
 
-#ifdef Q_OS_DARWIN
-#include <CoreGraphics/CGError.h>
-extern "C" {
-    typedef int CGSConnection;
-    typedef enum {
-        CGSGlobalHotKeyEnable = 0,
-        CGSGlobalHotKeyDisable = 1,
-    } CGSGlobalHotKeyOperatingMode;
+// activeGamepadMask is a short, so we're bounded by the number of mask bits
+#define MAX_GAMEPADS 16
 
-    extern CGSConnection _CGSDefaultConnection(void);
-
-    extern CGError CGSGetGlobalHotKeyOperatingMode(CGSConnection connection,
-                                                   CGSGlobalHotKeyOperatingMode* mode);
-
-    extern CGError CGSSetGlobalHotKeyOperatingMode(CGSConnection connection,
-                                                   CGSGlobalHotKeyOperatingMode mode);
-}
-#endif
-
-#define MAX_GAMEPADS 4
 #define MAX_FINGERS 2
 
 #define GAMEPAD_HAPTIC_METHOD_NONE 0
@@ -61,8 +53,7 @@ extern "C" {
 class SdlInputHandler
 {
 public:
-    explicit SdlInputHandler(StreamingPreferences& prefs, NvComputer* computer,
-                             int streamWidth, int streamHeight);
+    explicit SdlInputHandler(StreamingPreferences& prefs, int streamWidth, int streamHeight);
 
     ~SdlInputHandler();
 
@@ -82,11 +73,27 @@ public:
 
     void handleControllerDeviceEvent(SDL_ControllerDeviceEvent* event);
 
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    void handleControllerSensorEvent(SDL_ControllerSensorEvent* event);
+
+    void handleControllerTouchpadEvent(SDL_ControllerTouchpadEvent* event);
+#endif
+
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+    void handleJoystickBatteryEvent(SDL_JoyBatteryEvent* event);
+#endif
+
     void handleJoystickArrivalEvent(SDL_JoyDeviceEvent* event);
 
     void sendText(QString& string);
 
-    void rumble(unsigned short controllerNumber, unsigned short lowFreqMotor, unsigned short highFreqMotor);
+    void rumble(uint16_t controllerNumber, uint16_t lowFreqMotor, uint16_t highFreqMotor);
+
+    void rumbleTriggers(uint16_t controllerNumber, uint16_t leftTrigger, uint16_t rightTrigger);
+
+    void setMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz);
+
+    void setControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
     void handleTouchFingerEvent(SDL_TouchFingerEvent* event);
 
@@ -98,8 +105,6 @@ public:
 
     void notifyFocusLost();
 
-    void notifyFocusGained();
-
     bool isCaptureActive();
 
     bool isSystemKeyCaptureActive();
@@ -108,11 +113,9 @@ public:
 
     bool isMouseInVideoRegion(int mouseX, int mouseY, int windowWidth = -1, int windowHeight = -1);
 
-    void updateMousePositionReport(int mouseX, int mouseY);
-
-    void flushMousePositionUpdate();
-
     void updateKeyboardGrabState();
+
+    void updatePointerRegionLock();
 
     static
     QString getUnmappedGamepads();
@@ -127,6 +130,7 @@ private:
         KeyComboToggleCursorHide,
         KeyComboToggleMinimize,
         KeyComboPasteText,
+        KeyComboTogglePointerRegionLock,
         KeyComboMax
     };
 
@@ -135,7 +139,13 @@ private:
 
     void sendGamepadState(GamepadState* state);
 
+    void sendGamepadBatteryState(GamepadState* state, SDL_JoystickPowerLevel level);
+
     void handleAbsoluteFingerEvent(SDL_TouchFingerEvent* event);
+
+    void emulateAbsoluteFingerEvent(SDL_TouchFingerEvent* event);
+
+    void disableTouchFeedback();
 
     void handleRelativeFingerEvent(SDL_TouchFingerEvent* event);
 
@@ -143,9 +153,6 @@ private:
 
     static
     Uint32 longPressTimerCallback(Uint32 interval, void* param);
-
-    static
-    Uint32 mouseMoveTimerCallback(Uint32 interval, void* param);
 
     static
     Uint32 mouseEmulationTimerCallback(Uint32 interval, void* param);
@@ -159,27 +166,17 @@ private:
     static
     Uint32 dragTimerCallback(Uint32 interval, void* param);
 
-    static
-    int clipboardThreadProc(void *ptr);
-
     SDL_Window* m_Window;
     bool m_MultiController;
     bool m_GamepadMouse;
     bool m_SwapMouseButtons;
     bool m_ReverseScrollDirection;
     bool m_SwapFaceButtons;
-    SDL_TimerID m_MouseMoveTimer;
-    SDL_atomic_t m_MouseDeltaX;
-    SDL_atomic_t m_MouseDeltaY;
 
-    SDL_SpinLock m_MousePositionLock;
-    struct {
-        int x, y;
-        int windowWidth, windowHeight;
-    } m_MousePositionReport;
-    SDL_atomic_t m_MousePositionUpdated;
     bool m_MouseWasInVideoRegion;
     bool m_PendingMouseButtonsAllUpOnVideoRegionLeave;
+    bool m_PointerRegionLockActive;
+    bool m_PointerRegionLockToggledByUser;
 
     int m_GamepadMask;
     GamepadState m_GamepadState[MAX_GAMEPADS];
@@ -187,12 +184,9 @@ private:
     bool m_FakeCaptureActive;
     QString m_OldIgnoreDevices;
     QString m_OldIgnoreDevicesExcept;
+    QStringList m_IgnoreDeviceGuids;
     StreamingPreferences::CaptureSysKeysMode m_CaptureSystemKeysMode;
     int m_MouseCursorCapturedVisibilityState;
-
-#ifdef Q_OS_DARWIN
-    CGSGlobalHotKeyOperatingMode m_OldHotKeyMode;
-#endif
 
     struct {
         KeyCombo keyCombo;
@@ -208,6 +202,7 @@ private:
     int m_StreamHeight;
     bool m_AbsoluteMouseMode;
     bool m_AbsoluteTouchMode;
+    bool m_DisabledTouchFeedback;
 
     SDL_TouchFingerEvent m_TouchDownEvent[MAX_FINGERS];
     SDL_TimerID m_LeftButtonReleaseTimer;
@@ -215,12 +210,6 @@ private:
     SDL_TimerID m_DragTimer;
     char m_DragButton;
     int m_NumFingersDown;
-
-    SDL_Thread* m_ClipboardThread;
-    SDL_atomic_t m_ShutdownClipboardThread;
-    QString m_ClipboardData;
-    SDL_cond* m_ClipboardHasData;
-    SDL_mutex* m_ClipboardLock;
 
     static const int k_ButtonMap[];
 };

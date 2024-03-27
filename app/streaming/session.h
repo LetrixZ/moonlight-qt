@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QSemaphore>
+#include <QWindow>
 
 #include <Limelight.h>
 #include <opus_multistream.h>
@@ -22,13 +23,16 @@ class Session : public QObject
 public:
     explicit Session(NvComputer* computer, NvApp& app, StreamingPreferences *preferences = nullptr);
 
-    virtual ~Session();
+    // NB: This may not get destroyed for a long time! Don't put any cleanup here.
+    // Use Session::exec() or DeferredSessionCleanupTask instead.
+    virtual ~Session() {};
 
-    Q_INVOKABLE void exec(int displayOriginX, int displayOriginY);
+    Q_INVOKABLE void exec(QWindow* qtWindow);
 
     static
     void getDecoderInfo(SDL_Window* window,
-                       bool& isHardwareAccelerated, bool& isFullScreenOnly, QSize& maxResolution);
+                        bool& isHardwareAccelerated, bool& isFullScreenOnly,
+                        bool& isHdrSupported, QSize& maxResolution);
 
     static Session* get()
     {
@@ -56,6 +60,9 @@ signals:
     void quitStarting();
 
     void sessionFinished(int portTestResult);
+
+    // Emitted after sessionFinished() when the session is ready to be destroyed
+    void readyForDeletion();
 
 private:
     void execInternal();
@@ -116,6 +123,18 @@ private:
     void clConnectionStatusUpdate(int connectionStatus);
 
     static
+    void clSetHdrMode(bool enabled);
+
+    static
+    void clRumbleTriggers(uint16_t controllerNumber, uint16_t leftTrigger, uint16_t rightTrigger);
+
+    static
+    void clSetMotionEventState(uint16_t controllerNumber, uint8_t motionType, uint16_t reportRateHz);
+
+    static
+    void clSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
+
+    static
     int arInit(int audioConfiguration,
                const POPUS_MULTISTREAM_CONFIGURATION opusConfig,
                void* arContext, int arFlags);
@@ -145,17 +164,13 @@ private:
     SDL_Window* m_Window;
     IVideoDecoder* m_VideoDecoder;
     SDL_SpinLock m_DecoderLock;
-    bool m_NeedsIdr;
     bool m_AudioDisabled;
     bool m_AudioMuted;
     Uint32 m_FullScreenFlag;
-    int m_DisplayOriginX;
-    int m_DisplayOriginY;
+    QWindow* m_QtWindow;
     bool m_ThreadedExec;
-    bool m_PendingWindowedTransition;
     bool m_UnexpectedTermination;
     SdlInputHandler* m_InputHandler;
-    SDL_SpinLock m_InputHandlerLock;
     int m_MouseEmulationRefCount;
     int m_FlushingWindowEventsRef;
 

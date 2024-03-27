@@ -118,7 +118,7 @@ public:
             }
             break;
         // Occurs when the previous app quit has been completed, handles quitting errors if any
-        // happended. ComputerUpdated event's handler handles session start when previous app has
+        // happened. ComputerUpdated event's handler handles session start when previous app has
         // quit.
         case Event::AppQuitCompleted:
             if (m_State == StateSeekApp && !event.errorMessage.isEmpty()) {
@@ -162,7 +162,7 @@ public:
 
     QString getCurrentAppName() const
     {
-        for (NvApp app : m_Computer->appList) {
+        for (const NvApp& app : m_Computer->appList) {
             if (m_Computer->currentGameId == app.id) {
                 return app.name;
             }
